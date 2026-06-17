@@ -22,6 +22,7 @@ En Streamlit-app, der overfører musikrapport-data fra en Excel-export med mange
 - Automatisk samling af gentagne bumpers/vignetter, fx norske bumpers, så de skrives som `Bumpernavn x antal`
 - Valgfri MusicBrainz-validering af komponister/writers for tracks markeret som **Existing music**
 - Preview i browseren med kolonnen **Data Match**, når MusicBrainz-validering er slået til
+- Progress bar under behandlingen, så man kan se hvor langt appen er nået
 - Download resultatet direkte i browseren
 
 ## MusicBrainz-validering

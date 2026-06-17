@@ -1418,7 +1418,15 @@ def validate_one_song_with_musicbrainz(song: dict) -> dict:
     return validated_song
 
 
-def validate_songs_with_musicbrainz(songs: list[dict], validate_musicbrainz: bool, max_checks: int = 50):
+def validate_songs_with_musicbrainz(
+    songs: list[dict],
+    validate_musicbrainz: bool,
+    max_checks: int = 50,
+    progress_callback=None,
+    progress_start: float = 0,
+    progress_end: float = 100,
+    progress_label: str = "Validerer med MusicBrainz",
+):
     """
     Validerer alle Existing music-sange mod MusicBrainz, hvis funktionen er slået til.
 
@@ -1427,6 +1435,7 @@ def validate_songs_with_musicbrainz(songs: list[dict], validate_musicbrainz: boo
     tydeligt i previewet.
     """
     if not validate_musicbrainz:
+        update_progress_safely(progress_callback, progress_end, "MusicBrainz-validering er slået fra")
         return songs, {
             "enabled": False,
             "checked": 0,
@@ -1438,6 +1447,13 @@ def validate_songs_with_musicbrainz(songs: list[dict], validate_musicbrainz: boo
     checked = 0
     existing_music_total = sum(1 for song in songs if is_existing_music(song))
     warnings = []
+    check_limit = min(existing_music_total, max_checks or existing_music_total) or 1
+
+    update_progress_safely(
+        progress_callback,
+        progress_start,
+        f"{progress_label}: starter ({existing_music_total} Existing music-tracks fundet)",
+    )
 
     if musicbrainzngs is None:
         warnings.append("MusicBrainz-validering er slået til, men musicbrainzngs er ikke installeret.")
@@ -1458,6 +1474,16 @@ def validate_songs_with_musicbrainz(songs: list[dict], validate_musicbrainz: boo
         checked += 1
         validated_songs.append(validate_one_song_with_musicbrainz(song))
 
+        # Opdater progressbaren efter hvert MusicBrainz-tjek.
+        # Ved mange tracks kan brugeren derfor se, at appen stadig arbejder.
+        fraction_done = min(checked / check_limit, 1)
+        current_progress = progress_start + (progress_end - progress_start) * fraction_done
+        update_progress_safely(
+            progress_callback,
+            current_progress,
+            f"{progress_label}: {checked}/{check_limit} tjekket",
+        )
+
         # Lille pause mellem nye API-kald. Cachede kald er hurtige, men ukendte
         # sange bør ikke spamme MusicBrainz unødigt.
         if checked < existing_music_total:
@@ -1468,6 +1494,8 @@ def validate_songs_with_musicbrainz(songs: list[dict], validate_musicbrainz: boo
             f"MusicBrainz-validering tjekkede {checked} af {existing_music_total} Existing music-tracks. "
             "Hæv maksgrænsen i appen, hvis alle skal tjekkes."
         )
+
+    update_progress_safely(progress_callback, progress_end, f"{progress_label}: færdig")
 
     return validated_songs, {
         "enabled": True,
@@ -1699,6 +1727,24 @@ def get_sheet_names(source_file_bytes: bytes) -> list[str]:
     return workbook.sheetnames
 
 
+def update_progress_safely(progress_callback, percent: float, message: str):
+    """
+    Opdaterer progress baren uden at risikere, at selve databehandlingen crasher.
+
+    Funktionen får en callback fra Streamlit-UI'et. Hvis callbacken mod forventning
+    fejler, ignorerer vi fejlen, fordi rapporten stadig skal kunne laves færdig.
+    """
+    if progress_callback is None:
+        return
+
+    try:
+        clean_percent = int(max(0, min(100, round(percent))))
+        progress_callback(clean_percent, message)
+    except Exception:
+        # Progressbaren er kun brugerflade. Den må aldrig stoppe rapportgenereringen.
+        pass
+
+
 def process_files(
     template_file_bytes: bytes,
     source_file_bytes: bytes,
@@ -1708,6 +1754,7 @@ def process_files(
     auto_group_special: bool = True,
     validate_musicbrainz: bool = False,
     max_musicbrainz_checks: int = 50,
+    progress_callback=None,
 ):
     """
     Hele databehandlingen samlet ét sted.
@@ -1721,6 +1768,8 @@ def process_files(
     - output_bytes: færdig Excel-fil som bytes
     - summary: info til brugerfladen
     """
+    update_progress_safely(progress_callback, 3, "Åbner kildefilen")
+
     # Åbn kildefilen
     source_wb = load_workbook(
         io.BytesIO(source_file_bytes),
@@ -1732,10 +1781,12 @@ def process_files(
         raise ValueError(f"Den valgte fane findes ikke i kildefilen: {selected_sheet}")
 
     source_ws = source_wb[selected_sheet]
+    update_progress_safely(progress_callback, 12, f"Læser fanen: {selected_sheet}")
 
     # Udtræk metadata og musikdata
     metadata = extract_metadata(source_ws)
     songs = extract_music_rows(source_ws)
+    update_progress_safely(progress_callback, 28, f"Fandt {len(songs)} musiklinjer i {selected_sheet}")
 
     original_song_count = len(songs)
 
@@ -1746,6 +1797,7 @@ def process_files(
         production_type=production_type,
         auto_group_special=auto_group_special,
     )
+    update_progress_safely(progress_callback, 38, "Anvender land- og produktionstype-regler")
 
     # Valgfri MusicBrainz-validering. Den påvirker kun Streamlit-previewet,
     # ikke selve Excel-skabelonen.
@@ -1753,7 +1805,13 @@ def process_files(
         songs=songs,
         validate_musicbrainz=validate_musicbrainz,
         max_checks=max_musicbrainz_checks,
+        progress_callback=progress_callback,
+        progress_start=40,
+        progress_end=75,
+        progress_label="Validerer komponister med MusicBrainz",
     )
+
+    update_progress_safely(progress_callback, 78, "Åbner Excel-skabelonen")
 
     # Åbn skabelonen
     template_wb = load_workbook(
@@ -1772,6 +1830,7 @@ def process_files(
     write_metadata_to_template(template_ws, metadata)
     write_report_context_to_template(template_ws, selected_country, production_type)
     write_result = write_music_to_template(template_ws, songs)
+    update_progress_safely(progress_callback, 90, "Skriver musikdata ind i skabelonen")
 
     # Læg regelmotorens advarsler sammen med Excel-skrivningens advarsler.
     write_result["warnings"] = (
@@ -1782,9 +1841,11 @@ def process_files(
 
     # Gem workbook i hukommelsen i stedet for på disk.
     # Det gør, at Streamlit kan sende filen direkte til download-knappen.
+    update_progress_safely(progress_callback, 96, "Gemmer den færdige Excel-fil")
     output = io.BytesIO()
     template_wb.save(output)
     output.seek(0)
+    update_progress_safely(progress_callback, 100, "Færdig")
 
     summary = {
         "selected_sheet": selected_sheet,
@@ -1858,6 +1919,7 @@ def process_all_sheets_combined(
     auto_group_special: bool = True,
     validate_musicbrainz: bool = False,
     max_musicbrainz_checks: int = 50,
+    progress_callback=None,
 ):
     """
     Behandler alle faner og samler ALLE tracks i ÉN musikrapport.
@@ -1873,6 +1935,8 @@ def process_all_sheets_combined(
     eksisterende musikrække. Det er nødvendigt for at få alle tracks med i én
     samlet rapport.
     """
+    update_progress_safely(progress_callback, 3, "Åbner kildefilen")
+
     # Åbn kildefilen én gang
     source_wb = load_workbook(
         io.BytesIO(source_file_bytes),
@@ -1885,8 +1949,15 @@ def process_all_sheets_combined(
     errors = []
     first_metadata = None
 
-    for sheet_name in sheet_names:
+    total_sheets = max(len(sheet_names), 1)
+
+    for sheet_index, sheet_name in enumerate(sheet_names, start=1):
         try:
+            update_progress_safely(
+                progress_callback,
+                5 + (35 * (sheet_index - 1) / total_sheets),
+                f"Læser fane {sheet_index}/{total_sheets}: {sheet_name}",
+            )
             if sheet_name not in source_wb.sheetnames:
                 raise ValueError(f"Fane findes ikke i kildefilen: {sheet_name}")
 
@@ -1903,6 +1974,12 @@ def process_all_sheets_combined(
                 first_metadata = metadata
 
             all_songs.extend(songs)
+
+            update_progress_safely(
+                progress_callback,
+                5 + (35 * sheet_index / total_sheets),
+                f"Fane {sheet_index}/{total_sheets} læst: {len(songs)} tracks",
+            )
 
             summaries.append(
                 {
@@ -1935,6 +2012,7 @@ def process_all_sheets_combined(
         )
 
     original_all_song_count = len(all_songs)
+    update_progress_safely(progress_callback, 45, f"Samler {len(all_songs)} tracks fra alle faner")
 
     # Når alle tracks er samlet fra alle faner, kan vi samle gentagne bumpers/vignetter
     # på tværs af hele uploadet. Det er især nyttigt for fx norske bumpers.
@@ -1944,13 +2022,20 @@ def process_all_sheets_combined(
         production_type=production_type,
         auto_group_special=auto_group_special,
     )
+    update_progress_safely(progress_callback, 55, "Anvender land- og produktionstype-regler på samlet rapport")
 
     # Valgfri MusicBrainz-validering på den samlede trackliste.
     all_songs, musicbrainz_summary = validate_songs_with_musicbrainz(
         songs=all_songs,
         validate_musicbrainz=validate_musicbrainz,
         max_checks=max_musicbrainz_checks,
+        progress_callback=progress_callback,
+        progress_start=58,
+        progress_end=82,
+        progress_label="Validerer samlet rapport med MusicBrainz",
     )
+
+    update_progress_safely(progress_callback, 85, "Åbner Excel-skabelonen")
 
     # Åbn skabelonen
     template_wb = load_workbook(
@@ -1977,6 +2062,7 @@ def process_all_sheets_combined(
 
     # Skriv ALLE tracks ind i den samme Music content-tabel.
     write_result = write_music_to_template(template_ws, all_songs, allow_expand=True)
+    update_progress_safely(progress_callback, 93, "Skriver alle tracks ind i samlet rapport")
 
     # Tilføj eventuelle warnings fra regelmotoren og selve skrivningen til summary.
     write_result["warnings"] = (
@@ -1987,9 +2073,11 @@ def process_all_sheets_combined(
     for warning in write_result["warnings"]:
         summaries[0].setdefault("warnings", []).append(warning)
 
+    update_progress_safely(progress_callback, 97, "Gemmer samlet Excel-fil")
     output = io.BytesIO()
     template_wb.save(output)
     output.seek(0)
+    update_progress_safely(progress_callback, 100, "Færdig")
 
     summary = {
         "mode": "combined",
@@ -2026,6 +2114,7 @@ def process_all_sheets_separate_files(
     auto_group_special: bool = True,
     validate_musicbrainz: bool = False,
     max_musicbrainz_checks: int = 50,
+    progress_callback=None,
 ):
     """
     Behandler alle faner og laver én separat Excel-rapport pr. fane.
@@ -2033,14 +2122,29 @@ def process_all_sheets_separate_files(
     Outputtet pakkes i en ZIP-fil, så brugeren kan downloade det hele på én gang.
     Dette er den mest klassiske "én musikrapport pr. fil"-løsning.
     """
+    update_progress_safely(progress_callback, 2, "Starter ZIP-eksport med én rapport pr. fane")
+
     zip_buffer = io.BytesIO()
     summaries = []
     errors = []
     used_zip_names = set()
 
+    total_sheets = max(len(sheet_names), 1)
+
     with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-        for sheet_name in sheet_names:
+        for sheet_index, sheet_name in enumerate(sheet_names, start=1):
             try:
+                sheet_start = 5 + (90 * (sheet_index - 1) / total_sheets)
+                sheet_end = 5 + (90 * sheet_index / total_sheets)
+
+                def sheet_progress(local_percent, local_message, sheet_name=sheet_name, sheet_index=sheet_index, sheet_start=sheet_start, sheet_end=sheet_end):
+                    overall_percent = sheet_start + (sheet_end - sheet_start) * (local_percent / 100)
+                    update_progress_safely(
+                        progress_callback,
+                        overall_percent,
+                        f"Fane {sheet_index}/{total_sheets} — {sheet_name}: {local_message}",
+                    )
+
                 finished_file_bytes, summary = process_files(
                     template_file_bytes=template_file_bytes,
                     source_file_bytes=source_file_bytes,
@@ -2050,6 +2154,7 @@ def process_all_sheets_separate_files(
                     auto_group_special=auto_group_special,
                     validate_musicbrainz=validate_musicbrainz,
                     max_musicbrainz_checks=max_musicbrainz_checks,
+                    progress_callback=sheet_progress,
                 )
 
                 output_filename = f"tv-appl-en_udfyldt_{safe_filename(sheet_name)}.xlsx"
@@ -2058,6 +2163,11 @@ def process_all_sheets_separate_files(
                 zip_file.writestr(output_filename, finished_file_bytes)
                 summary["output_filename"] = output_filename
                 summaries.append(summary)
+                update_progress_safely(
+                    progress_callback,
+                    sheet_end,
+                    f"Fane {sheet_index}/{total_sheets} færdig: {sheet_name}",
+                )
 
             except Exception as error:
                 # Hvis én fane fejler, skal hele appen ikke dø.
@@ -2078,6 +2188,7 @@ def process_all_sheets_separate_files(
             f"De første fejl var: {error_text}"
         )
 
+    update_progress_safely(progress_callback, 97, "Samler ZIP-filen")
     zip_buffer.seek(0)
 
     total_aggregated_original_rows = sum(
@@ -2137,6 +2248,8 @@ def process_all_sheets_separate_files(
         "song_count_written": sum(item.get("song_count_written", 0) for item in summaries),
         "song_count_skipped": sum(item.get("song_count_skipped", 0) for item in summaries),
     }
+
+    update_progress_safely(progress_callback, 100, "Færdig")
 
     return zip_buffer.getvalue(), summary
 
@@ -2305,7 +2418,18 @@ button_disabled = (
 
 if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
     try:
+        # Progressbar, så brugeren kan følge med i lange kørsler
+        # — især når alle faner eller MusicBrainz-validering er slået til.
+        progress_bar = st.progress(0, text="Starter...")
+        progress_caption = st.empty()
+
+        def ui_progress(percent, message):
+            clean_percent = int(max(0, min(100, percent)))
+            progress_bar.progress(clean_percent, text=message)
+            progress_caption.caption(f"{clean_percent}% — {message}")
+
         with st.spinner("Udfylder rapporten..."):
+            ui_progress(1, "Læser uploadede filer")
             template_bytes = template_file.getvalue()
             source_bytes = source_file.getvalue()
 
@@ -2319,6 +2443,7 @@ if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
                     auto_group_special=auto_group_special,
                     validate_musicbrainz=validate_musicbrainz,
                     max_musicbrainz_checks=max_musicbrainz_checks,
+                    progress_callback=ui_progress,
                 )
                 output_filename = "tv-appl-en_samlet_musikrapport_alle_tracks.xlsx"
                 download_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -2334,6 +2459,7 @@ if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
                     auto_group_special=auto_group_special,
                     validate_musicbrainz=validate_musicbrainz,
                     max_musicbrainz_checks=max_musicbrainz_checks,
+                    progress_callback=ui_progress,
                 )
                 output_filename = "tv-appl-en_rapporter_pr_fane.zip"
                 download_mime = "application/zip"
@@ -2349,6 +2475,7 @@ if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
                     auto_group_special=auto_group_special,
                     validate_musicbrainz=validate_musicbrainz,
                     max_musicbrainz_checks=max_musicbrainz_checks,
+                    progress_callback=ui_progress,
                 )
                 summary["mode"] = "single"
                 output_filename = f"tv-appl-en_udfyldt_{safe_filename(selected_sheet)}.xlsx"
@@ -2362,6 +2489,7 @@ if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
             st.session_state["download_mime"] = download_mime
             st.session_state["download_label"] = download_label
             st.session_state["summary"] = summary
+            ui_progress(100, "Rapporten er færdig og klar til download")
 
         st.success("Rapporten er udfyldt og klar til download.")
 
