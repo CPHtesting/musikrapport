@@ -1,54 +1,36 @@
 # Musikrapport → TV application
 
-En simpel Streamlit-app, der overfører data fra en musikrapport-export med mange faner til NCB-skabelonen `tv-appl-en.xlsx`.
+En lille Streamlit-app, der overfører musikrapport-data fra en Excel-export med mange faner til skabelonen `tv-appl-en.xlsx`.
 
-## Hvad appen gør
+## Hvad kan appen?
 
-- Upload skabelonen `tv-appl-en.xlsx`
-- Upload kildefilen med musikdata
-- Vælg fane fra kildefilen
-- Tryk **Udfyld Rapport**
-- Download den udfyldte Excel-fil
+- Upload en skabelonfil (`tv-appl-en.xlsx`)
+- Upload en kildefil med musikdata
+- Vælg enten:
+  - én bestemt fane, eller
+  - alle faner på én gang
+- Download resultatet direkte i browseren
 
-Appen bruger `openpyxl` og forsøger at bevare skabelonens layout, struktur og formatering ved kun at skrive værdier ind i eksisterende celler.
+Hvis du vælger **én valgt fane**, får du én færdig `.xlsx`-fil.
 
-## Filer i projektet
+Hvis du vælger **alle faner**, får du en `.zip`-fil med én færdig Excel-rapport pr. fane.
 
-```text
-app.py
-requirements.txt
-README.md
-.gitignore
-```
-
-## Kør appen lokalt
-
-Installer først pakkerne:
+## Kør lokalt
 
 ```bash
 pip install -r requirements.txt
-```
-
-Start appen:
-
-```bash
 streamlit run app.py
 ```
 
 ## Deploy på Streamlit Community Cloud
 
-1. Upload disse filer til et GitHub-repository.
+1. Upload `app.py`, `requirements.txt` og `README.md` til et GitHub-repository.
 2. Gå til Streamlit Community Cloud.
-3. Vælg dit repository.
-4. Sæt **Main file path** til:
-
-```text
-app.py
-```
-
-5. Tryk **Deploy**.
+3. Vælg repository.
+4. Sæt branch til `main`.
+5. Sæt main file path til `app.py`.
+6. Tryk Deploy.
 
 ## Vigtigt
 
-Excel-filer er ignoreret i `.gitignore`, så du ikke ved en fejl uploader skabeloner eller musikrapporter til GitHub.
-Filerne skal uploades direkte i appen via browseren.
+Læg ikke rigtige Excel-rapporter eller skabeloner offentligt på GitHub, hvis de indeholder følsomme data. Appen er lavet til, at filerne uploades i browseren.

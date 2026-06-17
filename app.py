@@ -17,6 +17,7 @@ import io
 import re
 import traceback
 import unicodedata
+import zipfile
 from datetime import datetime, time, timedelta
 
 import streamlit as st
@@ -38,8 +39,9 @@ st.title("🎵 Musikrapport → TV application")
 st.markdown(
     """
 Upload først NCB-skabelonen **tv-appl-en.xlsx** og derefter musikrapport-exporten.
-Når kildefilen er uploadet, finder appen automatisk alle faner, så du kan vælge,
-hvilken episode/fane der skal overføres til skabelonen.
+Når kildefilen er uploadet, finder appen automatisk alle faner. Du kan enten vælge
+én bestemt fane eller udtrække alle faner på én gang. Hvis du vælger alle faner,
+får du en ZIP-fil med én færdig Excel-rapport pr. fane.
 
 Appen skriver kun værdier ind i de relevante celler og bevarer skabelonens layout,
 kolonnebredder og formatering.
@@ -834,6 +836,100 @@ def process_files(template_file_bytes: bytes, source_file_bytes: bytes, selected
     return output.getvalue(), summary
 
 
+def make_unique_zip_name(filename: str, used_names: set[str]) -> str:
+    """
+    Sørger for, at filnavne inde i ZIP-filen er unikke.
+
+    Hvis to faner mod forventning giver samme filnavn, laver vi fx:
+    - rapport.xlsx
+    - rapport_2.xlsx
+    """
+    if filename not in used_names:
+        used_names.add(filename)
+        return filename
+
+    if "." in filename:
+        base, extension = filename.rsplit(".", 1)
+        extension = "." + extension
+    else:
+        base, extension = filename, ""
+
+    counter = 2
+    while True:
+        candidate = f"{base}_{counter}{extension}"
+        if candidate not in used_names:
+            used_names.add(candidate)
+            return candidate
+        counter += 1
+
+
+def process_all_sheets(template_file_bytes: bytes, source_file_bytes: bytes, sheet_names: list[str]):
+    """
+    Behandler alle faner i kildefilen.
+
+    Vigtigt valg:
+    I stedet for at mase alle faner ind i én Excel-skabelon laver appen én færdig
+    tv-appl-en-rapport pr. fane. Det er den mest sikre måde at bevare skabelonens
+    struktur, layout og cellereferencer 1:1.
+
+    Outputtet pakkes i en ZIP-fil, så brugeren kan downloade det hele på én gang.
+    """
+    zip_buffer = io.BytesIO()
+    summaries = []
+    errors = []
+    used_zip_names = set()
+
+    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        for sheet_name in sheet_names:
+            try:
+                finished_file_bytes, summary = process_files(
+                    template_file_bytes=template_file_bytes,
+                    source_file_bytes=source_file_bytes,
+                    selected_sheet=sheet_name,
+                )
+
+                output_filename = f"tv-appl-en_udfyldt_{safe_filename(sheet_name)}.xlsx"
+                output_filename = make_unique_zip_name(output_filename, used_zip_names)
+
+                zip_file.writestr(output_filename, finished_file_bytes)
+                summary["output_filename"] = output_filename
+                summaries.append(summary)
+
+            except Exception as error:
+                # Hvis én fane fejler, skal hele appen ikke dø.
+                # Vi gemmer fejlen og fortsætter med næste fane.
+                errors.append(
+                    {
+                        "sheet": sheet_name,
+                        "error": str(error),
+                    }
+                )
+
+    if not summaries:
+        error_text = "; ".join(
+            f"{item['sheet']}: {item['error']}" for item in errors[:5]
+        )
+        raise ValueError(
+            "Ingen faner kunne behandles. "
+            f"De første fejl var: {error_text}"
+        )
+
+    zip_buffer.seek(0)
+
+    summary = {
+        "mode": "all",
+        "processed_count": len(summaries),
+        "error_count": len(errors),
+        "summaries": summaries,
+        "errors": errors,
+        "song_count_found": sum(item.get("song_count_found", 0) for item in summaries),
+        "song_count_written": sum(item.get("song_count_written", 0) for item in summaries),
+        "song_count_skipped": sum(item.get("song_count_skipped", 0) for item in summaries),
+    }
+
+    return zip_buffer.getvalue(), summary
+
+
 def safe_filename(text: str) -> str:
     """
     Gør et fanenavn sikkert som filnavn.
@@ -870,6 +966,7 @@ with col2:
 
 
 selected_sheet = None
+process_mode = None
 sheet_names = []
 
 if source_file is not None:
@@ -878,12 +975,28 @@ if source_file is not None:
         sheet_names = get_sheet_names(source_bytes_for_sheets)
 
         if sheet_names:
-            selected_sheet = st.selectbox(
-                "3. Vælg hvilken fane der skal udtrækkes fra",
-                options=sheet_names,
-                index=0,
-            )
             st.caption(f"Fandt {len(sheet_names)} faner i kildefilen.")
+
+            process_mode = st.radio(
+                "3. Hvad vil du udtrække?",
+                options=["Én valgt fane", "Alle faner"],
+                horizontal=True,
+            )
+
+            if process_mode == "Én valgt fane":
+                selected_sheet = st.selectbox(
+                    "Vælg hvilken fane der skal udtrækkes fra",
+                    options=sheet_names,
+                    index=0,
+                )
+            else:
+                st.info(
+                    f"Alle {len(sheet_names)} faner bliver behandlet. "
+                    "Du får én ZIP-fil med én udfyldt Excel-rapport pr. fane."
+                )
+                with st.expander("Se faner, der kommer med"):
+                    for sheet_name in sheet_names:
+                        st.write(f"- {sheet_name}")
         else:
             st.warning("Kildefilen indeholder ingen faner.")
 
@@ -898,7 +1011,13 @@ if source_file is not None:
 
 st.divider()
 
-button_disabled = template_file is None or source_file is None or selected_sheet is None
+button_disabled = (
+    template_file is None
+    or source_file is None
+    or not sheet_names
+    or process_mode is None
+    or (process_mode == "Én valgt fane" and selected_sheet is None)
+)
 
 if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
     try:
@@ -906,18 +1025,33 @@ if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
             template_bytes = template_file.getvalue()
             source_bytes = source_file.getvalue()
 
-            finished_file_bytes, summary = process_files(
-                template_file_bytes=template_bytes,
-                source_file_bytes=source_bytes,
-                selected_sheet=selected_sheet,
-            )
+            if process_mode == "Alle faner":
+                finished_file_bytes, summary = process_all_sheets(
+                    template_file_bytes=template_bytes,
+                    source_file_bytes=source_bytes,
+                    sheet_names=sheet_names,
+                )
+                output_filename = "tv-appl-en_udfyldt_alle_faner.zip"
+                download_mime = "application/zip"
+                download_label = "⬇️ Download ZIP med alle udfyldte rapporter"
 
-            output_filename = f"tv-appl-en_udfyldt_{safe_filename(selected_sheet)}.xlsx"
+            else:
+                finished_file_bytes, summary = process_files(
+                    template_file_bytes=template_bytes,
+                    source_file_bytes=source_bytes,
+                    selected_sheet=selected_sheet,
+                )
+                summary["mode"] = "single"
+                output_filename = f"tv-appl-en_udfyldt_{safe_filename(selected_sheet)}.xlsx"
+                download_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                download_label = "⬇️ Download udfyldt Excel-fil"
 
             # Gem resultatet i session_state, så download-knappen stadig virker
             # efter Streamlit har genindlæst siden.
             st.session_state["finished_file_bytes"] = finished_file_bytes
             st.session_state["output_filename"] = output_filename
+            st.session_state["download_mime"] = download_mime
+            st.session_state["download_label"] = download_label
             st.session_state["summary"] = summary
 
         st.success("Rapporten er udfyldt og klar til download.")
@@ -942,26 +1076,62 @@ if "finished_file_bytes" in st.session_state:
 
     st.subheader("✅ Klar til download")
 
-    st.write(f"**Valgt fane:** {summary.get('selected_sheet', '')}")
-    st.write(f"**Musiknumre fundet i kildefilen:** {summary.get('song_count_found', 0)}")
-    st.write(f"**Musiknumre skrevet i skabelonen:** {summary.get('song_count_written', 0)}")
+    if summary.get("mode") == "all":
+        st.write("**Udtræk:** Alle faner")
+        st.write(f"**Faner behandlet:** {summary.get('processed_count', 0)}")
+        st.write(f"**Faner med fejl:** {summary.get('error_count', 0)}")
+        st.write(f"**Musiknumre fundet i alt:** {summary.get('song_count_found', 0)}")
+        st.write(f"**Musiknumre skrevet i alt:** {summary.get('song_count_written', 0)}")
 
-    if summary.get("song_count_skipped", 0) > 0:
-        st.write(f"**Musiknumre sprunget over:** {summary.get('song_count_skipped', 0)}")
+        if summary.get("song_count_skipped", 0) > 0:
+            st.write(f"**Musiknumre sprunget over i alt:** {summary.get('song_count_skipped', 0)}")
 
-    warnings = summary.get("warnings", [])
-    for warning in warnings:
-        st.warning(warning)
+        with st.expander("Se behandlede faner"):
+            for item in summary.get("summaries", []):
+                st.write(
+                    f"- **{item.get('selected_sheet', '')}** → "
+                    f"{item.get('output_filename', '')} "
+                    f"({item.get('song_count_written', 0)} musiknumre skrevet)"
+                )
 
-    metadata = summary.get("metadata", {})
-    with st.expander("Se metadata, der blev overført"):
-        st.write(metadata)
+        if summary.get("errors"):
+            st.warning(
+                "Nogle faner kunne ikke behandles. "
+                "De fungerende faner er stadig med i ZIP-filen."
+            )
+            with st.expander("Se fejl pr. fane"):
+                for item in summary.get("errors", []):
+                    st.write(f"- **{item.get('sheet', '')}**: {item.get('error', '')}")
+
+        all_warnings = []
+        for item in summary.get("summaries", []):
+            for warning in item.get("warnings", []):
+                all_warnings.append(f"{item.get('selected_sheet', '')}: {warning}")
+
+        for warning in all_warnings:
+            st.warning(warning)
+
+    else:
+        st.write(f"**Valgt fane:** {summary.get('selected_sheet', '')}")
+        st.write(f"**Musiknumre fundet i kildefilen:** {summary.get('song_count_found', 0)}")
+        st.write(f"**Musiknumre skrevet i skabelonen:** {summary.get('song_count_written', 0)}")
+
+        if summary.get("song_count_skipped", 0) > 0:
+            st.write(f"**Musiknumre sprunget over:** {summary.get('song_count_skipped', 0)}")
+
+        warnings = summary.get("warnings", [])
+        for warning in warnings:
+            st.warning(warning)
+
+        metadata = summary.get("metadata", {})
+        with st.expander("Se metadata, der blev overført"):
+            st.write(metadata)
 
     st.download_button(
-        label="⬇️ Download udfyldt Excel-fil",
+        label=st.session_state.get("download_label", "⬇️ Download fil"),
         data=st.session_state["finished_file_bytes"],
         file_name=st.session_state["output_filename"],
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mime=st.session_state.get("download_mime", "application/octet-stream"),
         type="primary",
     )
 
@@ -976,7 +1146,7 @@ with st.expander("Hvad gør appen helt præcist?"):
 Appen gør følgende:
 
 1. Læser alle faner i kildefilen.
-2. Lader dig vælge én fane.
+2. Lader dig vælge enten én fane eller alle faner.
 3. Finder metadatafelterne:
    - Production Company
    - Production Title
@@ -988,6 +1158,6 @@ Appen gør følgende:
 7. Splitter **Music Duration** til minutter og sekunder.
 8. Oversætter **Music Source** til skabelonens track types.
 9. Skriver værdierne ind i de eksisterende celler i skabelonen.
-10. Giver dig en færdig Excel-fil direkte i browseren.
+10. Giver dig enten én færdig Excel-fil eller en ZIP-fil med én Excel-rapport pr. fane direkte i browseren.
 """
     )
