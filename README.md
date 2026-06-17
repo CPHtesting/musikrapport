@@ -20,7 +20,35 @@ En Streamlit-app, der overfører musikrapport-data fra en Excel-export med mange
   - **Samlet musikrapport**: én Excel-fil, hvor alle tracks fra alle faner samles i den samme `Music content`-tabel
   - **Én musikrapport pr. fane**: én ZIP-fil med separate Excel-rapporter
 - Automatisk samling af gentagne bumpers/vignetter, fx norske bumpers, så de skrives som `Bumpernavn x antal`
+- Valgfri MusicBrainz-validering af komponister/writers for tracks markeret som **Existing music**
+- Preview i browseren med kolonnen **Data Match**, når MusicBrainz-validering er slået til
 - Download resultatet direkte i browseren
+
+## MusicBrainz-validering
+
+Appen har en toggle/knap:
+
+```text
+Validér komponister i Existing music med MusicBrainz
+```
+
+Når den er slået til, gør appen dette for Existing music-tracks:
+
+1. Søger efter sangens titel og artist i MusicBrainz som `works`.
+2. Henter relationer for det fundne work.
+3. Leder efter relationer som `composer`, `writer`, `author`, `lyricist` og `librettist`.
+4. Sammenligner efternavnene fra musikrapporten med MusicBrainz.
+5. Viser resultatet i preview-kolonnen **Data Match**.
+
+Eksempler:
+
+```text
+✅ Match — MusicBrainz: Lennon/McCartney
+❌ Tjek: mangler Smith. MusicBrainz foreslår: Williams/Jones
+⚪ Ikke fundet i MusicBrainz
+```
+
+MusicBrainz er et hjælpetjek og ikke en juridisk facitliste. Obskur library music, helt nye værker og visse TV-/production tracks findes ofte ikke i databasen.
 
 ## Smart-regler
 

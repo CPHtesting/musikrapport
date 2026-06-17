@@ -18,12 +18,22 @@ import re
 import traceback
 import unicodedata
 import zipfile
+import time as time_module
 from copy import copy
 from datetime import datetime, time, timedelta
+from difflib import SequenceMatcher
 
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
+
+# musicbrainzngs er et valgfrit dependency, som bruges til MusicBrainz-validering.
+# Vi importerer det i en try/except, så appen stadig kan køre, selv hvis pakken
+# ikke er installeret korrekt endnu.
+try:
+    import musicbrainzngs
+except Exception:
+    musicbrainzngs = None
 
 
 # ------------------------------------------------------------
@@ -1036,6 +1046,466 @@ def extract_music_rows(source_ws) -> list[dict]:
 
 
 # ------------------------------------------------------------
+# 8B. MUSICBRAINZ-VALIDERING AF KOMPONISTER
+# ------------------------------------------------------------
+
+MUSICBRAINZ_WRITER_RELATION_WORDS = [
+    "composer",
+    "writer",
+    "author",
+    "lyricist",
+    "librettist",
+]
+
+
+def normalize_for_match(value: str) -> str:
+    """
+    Gør navne/titler lettere at sammenligne.
+
+    Eksempel:
+    "Björk Guðmundsdóttir" og "Bjork Gudmundsdottir" bliver mere ens,
+    fordi accenter og specialtegn fjernes.
+    """
+    text = safe_text(value).casefold().strip()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = re.sub(r"[^a-z0-9æøå ]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def split_slash_names(value: str) -> list[str]:
+    """
+    Splitter komponist-/writer-felter fra rapporten.
+
+    Skabelonen bruger normalt slash mellem efternavne:
+    "Lennon/McCartney" → ["Lennon", "McCartney"]
+    """
+    text = safe_text(value)
+
+    if not text:
+        return []
+
+    return [part.strip() for part in re.split(r"\s*/\s*|\s*;\s*", text) if part.strip()]
+
+
+def get_report_writer_names(song: dict) -> list[str]:
+    """
+    Henter de navne, som allerede står i rapporten.
+
+    Vi kombinerer både Composers og Writers, fordi MusicBrainz kan bruge
+    forskellige relationstyper afhængigt af værket.
+    """
+    names = []
+    names.extend(split_slash_names(song.get("Composers", "")))
+    names.extend(split_slash_names(song.get("Writers", "")))
+    return unique_keep_order(names)
+
+
+def is_existing_music(song: dict) -> bool:
+    """
+    Tjekker om et track er Existing music.
+
+    MusicBrainz-valideringen skal kun køres på eksisterende musik, ikke på
+    library music eller commissioned music.
+    """
+    return normalize_text(song.get("Track type")) == "existing music"
+
+
+def setup_musicbrainz_client():
+    """
+    Klargør MusicBrainz-klienten.
+
+    MusicBrainz kræver, at API-kald identificerer applikationen med en user-agent.
+    Hvis musicbrainzngs ikke er installeret, returnerer funktionen en pæn fejltekst
+    i stedet for at crashe appen.
+    """
+    if musicbrainzngs is None:
+        return False, "Pakken musicbrainzngs er ikke installeret. Tjek requirements.txt."
+
+    try:
+        musicbrainzngs.set_useragent(
+            "musikrapport-streamlit-app",
+            "1.0",
+            "https://streamlit.app",
+        )
+        return True, ""
+    except Exception as error:
+        return False, f"Kunne ikke klargøre MusicBrainz-klienten: {error}"
+
+
+def extract_artist_name_from_relation(relation: dict) -> str:
+    """
+    Finder kunstner-/personnavn i en MusicBrainz-relation.
+
+    MusicBrainz-data kan variere en smule, så vi prøver flere mulige nøgler.
+    """
+    artist = relation.get("artist") or {}
+
+    if isinstance(artist, dict):
+        return safe_text(
+            artist.get("name")
+            or artist.get("sort-name")
+            or artist.get("artist-credit-phrase")
+        )
+
+    return safe_text(relation.get("name") or relation.get("target"))
+
+
+def extract_musicbrainz_writer_names(work: dict) -> list[str]:
+    """
+    Udtrækker komponist-/forfatternavne fra et MusicBrainz-work.
+
+    Vi leder efter artist-relationer med typer som composer, writer, author,
+    lyricist eller librettist.
+    """
+    names = []
+
+    relation_lists = []
+
+    # Typisk placering i musicbrainzngs for work → artist-relationer.
+    if isinstance(work.get("artist-relation-list"), list):
+        relation_lists.append(work.get("artist-relation-list"))
+
+    # Fallback, hvis API'et returnerer en mere generisk relation-list.
+    if isinstance(work.get("relation-list"), list):
+        relation_lists.append(work.get("relation-list"))
+
+    for relation_list in relation_lists:
+        for relation in relation_list:
+            relation_type = normalize_text(relation.get("type"))
+            target_type = normalize_text(relation.get("target-type"))
+
+            # Vi vil kun bruge person-/artist-relationer, ikke fx URL'er.
+            if target_type and target_type != "artist":
+                continue
+
+            if any(word in relation_type for word in MUSICBRAINZ_WRITER_RELATION_WORDS):
+                name = extract_artist_name_from_relation(relation)
+                if name:
+                    names.append(name)
+
+    return unique_keep_order(names)
+
+
+def similarity(a: str, b: str) -> float:
+    """
+    Lille fuzzy matching-funktion, så små variationer ikke ødelægger et match.
+    """
+    return SequenceMatcher(None, normalize_for_match(a), normalize_for_match(b)).ratio()
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def musicbrainz_lookup_work_writers(title: str, artist: str, max_candidates: int = 3) -> dict:
+    """
+    Slår et værk op i MusicBrainz og returnerer mulige writer/composer-navne.
+
+    Funktionen er cachet i 24 timer, så samme sang ikke slår API'et igen og igen,
+    hver gang Streamlit genindlæser appen.
+    """
+    ok, setup_error = setup_musicbrainz_client()
+    if not ok:
+        return {
+            "status": "error",
+            "message": setup_error,
+            "candidates": [],
+        }
+
+    title = safe_text(title)
+    artist = safe_text(artist)
+
+    if not title:
+        return {
+            "status": "not_found",
+            "message": "Ingen titel at søge på.",
+            "candidates": [],
+        }
+
+    candidates = []
+    seen_work_ids = set()
+
+    # Vi prøver først med både work/titel og artist. Hvis det ikke giver noget,
+    # prøver vi kun med titel. Det gør funktionen mere robust for obskure tracks.
+    search_attempts = []
+    if artist:
+        search_attempts.append({"work": title, "artist": artist})
+    search_attempts.append({"work": title})
+
+    try:
+        for fields in search_attempts:
+            try:
+                result = musicbrainzngs.search_works(
+                    limit=max_candidates,
+                    strict=False,
+                    **fields,
+                )
+                work_list = result.get("work-list", []) or []
+            except Exception:
+                # Hvis artist-søgningen fejler, prøver vi næste søgning.
+                work_list = []
+
+            for work_item in work_list[:max_candidates]:
+                work_id = work_item.get("id")
+                if not work_id or work_id in seen_work_ids:
+                    continue
+
+                seen_work_ids.add(work_id)
+
+                try:
+                    detail = musicbrainzngs.get_work_by_id(
+                        work_id,
+                        includes=["artist-rels"],
+                    )
+                    work = detail.get("work", {}) or {}
+                except Exception:
+                    work = work_item
+
+                writer_names = extract_musicbrainz_writer_names(work)
+                work_title = safe_text(work.get("title") or work_item.get("title"))
+
+                candidates.append(
+                    {
+                        "id": work_id,
+                        "title": work_title,
+                        "score": safe_text(work_item.get("score")),
+                        "writers": writer_names,
+                    }
+                )
+
+            if candidates:
+                break
+
+        if not candidates:
+            return {
+                "status": "not_found",
+                "message": "MusicBrainz fandt ikke et sikkert work-match.",
+                "candidates": [],
+            }
+
+        return {
+            "status": "ok",
+            "message": "",
+            "candidates": candidates,
+        }
+
+    except Exception as error:
+        return {
+            "status": "error",
+            "message": str(error),
+            "candidates": [],
+        }
+
+
+def compare_report_names_to_musicbrainz(report_names: list[str], mb_names: list[str]) -> dict:
+    """
+    Sammenligner rapportens komponister/writers med MusicBrainz-navne.
+
+    Vi sammenligner primært efternavne, fordi skabelonen kun kræver efternavne.
+    """
+    report_last_names = []
+    for name in report_names:
+        last_name = extract_last_name(name)
+        if last_name:
+            report_last_names.append(last_name)
+
+    mb_last_names = []
+    for name in mb_names:
+        last_name = extract_last_name(name)
+        if last_name:
+            mb_last_names.append(last_name)
+
+    report_keys = [normalize_for_match(name) for name in unique_keep_order(report_last_names)]
+    mb_keys = [normalize_for_match(name) for name in unique_keep_order(mb_last_names)]
+
+    missing = []
+    matched = []
+
+    for original_name, key in zip(unique_keep_order(report_last_names), report_keys):
+        # Først prøver vi direkte match på efternavn.
+        direct_match = key in mb_keys
+
+        # Derefter et lille fuzzy fallback, hvis der fx er en accent eller stavemåde,
+        # der afviger en smule.
+        fuzzy_match = any(similarity(key, mb_key) >= 0.86 for mb_key in mb_keys)
+
+        if direct_match or fuzzy_match:
+            matched.append(original_name)
+        else:
+            missing.append(original_name)
+
+    return {
+        "all_match": bool(report_keys) and not missing,
+        "matched": matched,
+        "missing": missing,
+        "musicbrainz_last_names": unique_keep_order(mb_last_names),
+        "musicbrainz_full_names": unique_keep_order(mb_names),
+    }
+
+
+def validate_one_song_with_musicbrainz(song: dict) -> dict:
+    """
+    Validerer én sang mod MusicBrainz.
+
+    Returnerer samme song-dict, men med en ekstra nøgle:
+    - Data Match
+    """
+    validated_song = dict(song)
+
+    if not is_existing_music(validated_song):
+        validated_song["Data Match"] = "— Ikke Existing music"
+        return validated_song
+
+    report_names = get_report_writer_names(validated_song)
+
+    if not report_names:
+        validated_song["Data Match"] = "⚠️ Ingen komponist/writer i rapporten"
+        return validated_song
+
+    lookup = musicbrainz_lookup_work_writers(
+        title=validated_song.get("Song title", ""),
+        artist=validated_song.get("Artist", ""),
+    )
+
+    if lookup.get("status") == "error":
+        validated_song["Data Match"] = f"⚠️ MusicBrainz-fejl: {lookup.get('message', '')}"
+        return validated_song
+
+    if lookup.get("status") == "not_found":
+        validated_song["Data Match"] = "⚪ Ikke fundet i MusicBrainz"
+        return validated_song
+
+    candidates = lookup.get("candidates", []) or []
+
+    if not candidates:
+        validated_song["Data Match"] = "⚪ Ikke fundet i MusicBrainz"
+        return validated_song
+
+    # Vælg den kandidat, der matcher flest rapportnavne.
+    best_candidate = None
+    best_comparison = None
+    best_score = -1
+
+    for candidate in candidates:
+        comparison = compare_report_names_to_musicbrainz(
+            report_names=report_names,
+            mb_names=candidate.get("writers", []),
+        )
+
+        score = len(comparison.get("matched", []))
+        score += similarity(validated_song.get("Song title"), candidate.get("title"))
+
+        if score > best_score:
+            best_score = score
+            best_candidate = candidate
+            best_comparison = comparison
+
+    if not best_candidate or not best_comparison:
+        validated_song["Data Match"] = "⚪ MusicBrainz fandt værk, men ingen writer/composer-relationer"
+        return validated_song
+
+    mb_suggestions = best_comparison.get("musicbrainz_last_names", [])
+    suggestion_text = "/".join(mb_suggestions) if mb_suggestions else "ingen forslag"
+
+    if best_comparison.get("all_match"):
+        validated_song["Data Match"] = f"✅ Match — MusicBrainz: {suggestion_text}"
+    else:
+        missing_text = "/".join(best_comparison.get("missing", [])) or "ukendt"
+        validated_song["Data Match"] = (
+            f"❌ Tjek: mangler {missing_text}. "
+            f"MusicBrainz foreslår: {suggestion_text}"
+        )
+
+    return validated_song
+
+
+def validate_songs_with_musicbrainz(songs: list[dict], validate_musicbrainz: bool, max_checks: int = 50):
+    """
+    Validerer alle Existing music-sange mod MusicBrainz, hvis funktionen er slået til.
+
+    max_checks er en sikkerhedsventil, så brugeren ikke utilsigtet laver hundredvis
+    af API-kald på én gang. Sangene, der ikke bliver tjekket pga. grænsen, markeres
+    tydeligt i previewet.
+    """
+    if not validate_musicbrainz:
+        return songs, {
+            "enabled": False,
+            "checked": 0,
+            "existing_music_total": sum(1 for song in songs if is_existing_music(song)),
+            "warnings": [],
+        }
+
+    validated_songs = []
+    checked = 0
+    existing_music_total = sum(1 for song in songs if is_existing_music(song))
+    warnings = []
+
+    if musicbrainzngs is None:
+        warnings.append("MusicBrainz-validering er slået til, men musicbrainzngs er ikke installeret.")
+
+    for song in songs:
+        if not is_existing_music(song):
+            song_copy = dict(song)
+            song_copy["Data Match"] = "— Ikke Existing music"
+            validated_songs.append(song_copy)
+            continue
+
+        if max_checks and checked >= max_checks:
+            song_copy = dict(song)
+            song_copy["Data Match"] = "⏭️ Ikke tjekket — maksgrænse nået"
+            validated_songs.append(song_copy)
+            continue
+
+        checked += 1
+        validated_songs.append(validate_one_song_with_musicbrainz(song))
+
+        # Lille pause mellem nye API-kald. Cachede kald er hurtige, men ukendte
+        # sange bør ikke spamme MusicBrainz unødigt.
+        if checked < existing_music_total:
+            time_module.sleep(1.0)
+
+    if max_checks and existing_music_total > max_checks:
+        warnings.append(
+            f"MusicBrainz-validering tjekkede {checked} af {existing_music_total} Existing music-tracks. "
+            "Hæv maksgrænsen i appen, hvis alle skal tjekkes."
+        )
+
+    return validated_songs, {
+        "enabled": True,
+        "checked": checked,
+        "existing_music_total": existing_music_total,
+        "warnings": warnings,
+    }
+
+
+def build_preview_rows(songs: list[dict], sheet_name: str = "", include_data_match: bool = False, max_rows: int = 500):
+    """
+    Bygger en enkel preview-tabel til Streamlit.
+
+    Previewet påvirker ikke Excel-outputtet. Det er kun til kvalitetskontrol i appen.
+    """
+    preview_rows = []
+
+    for song in songs[:max_rows]:
+        row = {
+            "Fane": sheet_name,
+            "Song title": song.get("Song title", ""),
+            "Artist": song.get("Artist", ""),
+            "Composers": song.get("Composers", ""),
+            "Writers": song.get("Writers", ""),
+            "Min": song.get("Min", ""),
+            "Sec": song.get("Sec", ""),
+            "Track type": song.get("Track type", ""),
+        }
+
+        if include_data_match:
+            row["Data Match"] = song.get("Data Match", "")
+
+        preview_rows.append(row)
+
+    return preview_rows
+
+
+# ------------------------------------------------------------
 # 9. UDFYLD SKABELONEN
 # ------------------------------------------------------------
 
@@ -1236,6 +1706,8 @@ def process_files(
     selected_country: str,
     production_type: str,
     auto_group_special: bool = True,
+    validate_musicbrainz: bool = False,
+    max_musicbrainz_checks: int = 50,
 ):
     """
     Hele databehandlingen samlet ét sted.
@@ -1275,6 +1747,14 @@ def process_files(
         auto_group_special=auto_group_special,
     )
 
+    # Valgfri MusicBrainz-validering. Den påvirker kun Streamlit-previewet,
+    # ikke selve Excel-skabelonen.
+    songs, musicbrainz_summary = validate_songs_with_musicbrainz(
+        songs=songs,
+        validate_musicbrainz=validate_musicbrainz,
+        max_checks=max_musicbrainz_checks,
+    )
+
     # Åbn skabelonen
     template_wb = load_workbook(
         io.BytesIO(template_file_bytes),
@@ -1294,7 +1774,11 @@ def process_files(
     write_result = write_music_to_template(template_ws, songs)
 
     # Læg regelmotorens advarsler sammen med Excel-skrivningens advarsler.
-    write_result["warnings"] = rule_summary.get("warnings", []) + write_result.get("warnings", [])
+    write_result["warnings"] = (
+        rule_summary.get("warnings", [])
+        + musicbrainz_summary.get("warnings", [])
+        + write_result.get("warnings", [])
+    )
 
     # Gem workbook i hukommelsen i stedet for på disk.
     # Det gør, at Streamlit kan sende filen direkte til download-knappen.
@@ -1308,6 +1792,12 @@ def process_files(
         "country": selected_country,
         "production_type": production_type,
         "rule_summary": rule_summary,
+        "musicbrainz_summary": musicbrainz_summary,
+        "preview_rows": build_preview_rows(
+            songs,
+            sheet_name=selected_sheet,
+            include_data_match=validate_musicbrainz,
+        ),
         "song_count_found": original_song_count,
         "song_count_after_rules": len(songs),
         "song_count_written": write_result["written_count"],
@@ -1366,6 +1856,8 @@ def process_all_sheets_combined(
     selected_country: str,
     production_type: str,
     auto_group_special: bool = True,
+    validate_musicbrainz: bool = False,
+    max_musicbrainz_checks: int = 50,
 ):
     """
     Behandler alle faner og samler ALLE tracks i ÉN musikrapport.
@@ -1453,6 +1945,13 @@ def process_all_sheets_combined(
         auto_group_special=auto_group_special,
     )
 
+    # Valgfri MusicBrainz-validering på den samlede trackliste.
+    all_songs, musicbrainz_summary = validate_songs_with_musicbrainz(
+        songs=all_songs,
+        validate_musicbrainz=validate_musicbrainz,
+        max_checks=max_musicbrainz_checks,
+    )
+
     # Åbn skabelonen
     template_wb = load_workbook(
         io.BytesIO(template_file_bytes),
@@ -1480,7 +1979,11 @@ def process_all_sheets_combined(
     write_result = write_music_to_template(template_ws, all_songs, allow_expand=True)
 
     # Tilføj eventuelle warnings fra regelmotoren og selve skrivningen til summary.
-    write_result["warnings"] = rule_summary.get("warnings", []) + write_result.get("warnings", [])
+    write_result["warnings"] = (
+        rule_summary.get("warnings", [])
+        + musicbrainz_summary.get("warnings", [])
+        + write_result.get("warnings", [])
+    )
     for warning in write_result["warnings"]:
         summaries[0].setdefault("warnings", []).append(warning)
 
@@ -1498,6 +2001,12 @@ def process_all_sheets_combined(
         "country": selected_country,
         "production_type": production_type,
         "rule_summary": rule_summary,
+        "musicbrainz_summary": musicbrainz_summary,
+        "preview_rows": build_preview_rows(
+            all_songs,
+            sheet_name="Alle faner",
+            include_data_match=validate_musicbrainz,
+        ),
         "song_count_found": original_all_song_count,
         "song_count_after_rules": len(all_songs),
         "song_count_written": write_result["written_count"],
@@ -1515,6 +2024,8 @@ def process_all_sheets_separate_files(
     selected_country: str,
     production_type: str,
     auto_group_special: bool = True,
+    validate_musicbrainz: bool = False,
+    max_musicbrainz_checks: int = 50,
 ):
     """
     Behandler alle faner og laver én separat Excel-rapport pr. fane.
@@ -1537,6 +2048,8 @@ def process_all_sheets_separate_files(
                     selected_country=selected_country,
                     production_type=production_type,
                     auto_group_special=auto_group_special,
+                    validate_musicbrainz=validate_musicbrainz,
+                    max_musicbrainz_checks=max_musicbrainz_checks,
                 )
 
                 output_filename = f"tv-appl-en_udfyldt_{safe_filename(sheet_name)}.xlsx"
@@ -1580,6 +2093,22 @@ def process_all_sheets_separate_files(
         for item in summaries
     )
 
+    preview_rows = []
+    for item in summaries:
+        preview_rows.extend(item.get("preview_rows", []))
+
+    total_musicbrainz_checked = sum(
+        item.get("musicbrainz_summary", {}).get("checked", 0)
+        for item in summaries
+    )
+    total_existing_music = sum(
+        item.get("musicbrainz_summary", {}).get("existing_music_total", 0)
+        for item in summaries
+    )
+    musicbrainz_warnings = []
+    for item in summaries:
+        musicbrainz_warnings.extend(item.get("musicbrainz_summary", {}).get("warnings", []))
+
     summary = {
         "mode": "separate_files",
         "processed_count": len(summaries),
@@ -1596,6 +2125,13 @@ def process_all_sheets_separate_files(
             "production_type": production_type,
             "auto_group_special": auto_group_special,
         },
+        "musicbrainz_summary": {
+            "enabled": validate_musicbrainz,
+            "checked": total_musicbrainz_checked,
+            "existing_music_total": total_existing_music,
+            "warnings": musicbrainz_warnings,
+        },
+        "preview_rows": preview_rows[:500],
         "song_count_found": sum(item.get("song_count_found", 0) for item in summaries),
         "song_count_after_rules": sum(item.get("song_count_after_rules", item.get("song_count_found", 0)) for item in summaries),
         "song_count_written": sum(item.get("song_count_written", 0) for item in summaries),
@@ -1665,6 +2201,31 @@ auto_group_special = st.checkbox(
 )
 
 st.info(COUNTRY_CONFIG[selected_country]["rule_note"])
+
+validate_musicbrainz = st.toggle(
+    "Validér komponister i Existing music med MusicBrainz",
+    value=False,
+    help=(
+        "Når denne er slået til, slår appen Existing music-tracks op i MusicBrainz "
+        "og viser en Data Match-kolonne i previewet. Det kan tage lidt tid, fordi "
+        "der laves API-kald for hvert tjekket track."
+    ),
+)
+
+max_musicbrainz_checks = 50
+if validate_musicbrainz:
+    st.warning(
+        "MusicBrainz-validering er et hjælpetjek — ikke en juridisk facitliste. "
+        "Obskur library music og meget nye værker findes ofte ikke i databasen."
+    )
+    max_musicbrainz_checks = st.number_input(
+        "Maks antal Existing music-tracks, der må tjekkes mod MusicBrainz",
+        min_value=1,
+        max_value=500,
+        value=50,
+        step=10,
+        help="Sæt tallet højere, hvis alle Existing music-tracks skal valideres. Lavere tal gør appen hurtigere.",
+    )
 
 selected_sheet = None
 process_mode = None
@@ -1756,6 +2317,8 @@ if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
                     selected_country=selected_country,
                     production_type=selected_production_type,
                     auto_group_special=auto_group_special,
+                    validate_musicbrainz=validate_musicbrainz,
+                    max_musicbrainz_checks=max_musicbrainz_checks,
                 )
                 output_filename = "tv-appl-en_samlet_musikrapport_alle_tracks.xlsx"
                 download_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -1769,6 +2332,8 @@ if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
                     selected_country=selected_country,
                     production_type=selected_production_type,
                     auto_group_special=auto_group_special,
+                    validate_musicbrainz=validate_musicbrainz,
+                    max_musicbrainz_checks=max_musicbrainz_checks,
                 )
                 output_filename = "tv-appl-en_rapporter_pr_fane.zip"
                 download_mime = "application/zip"
@@ -1782,6 +2347,8 @@ if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
                     selected_country=selected_country,
                     production_type=selected_production_type,
                     auto_group_special=auto_group_special,
+                    validate_musicbrainz=validate_musicbrainz,
+                    max_musicbrainz_checks=max_musicbrainz_checks,
                 )
                 summary["mode"] = "single"
                 output_filename = f"tv-appl-en_udfyldt_{safe_filename(selected_sheet)}.xlsx"
@@ -1895,6 +2462,26 @@ if "finished_file_bytes" in st.session_state:
             f"{rule_summary.get('aggregated_groups', 0)} linjer."
         )
 
+    musicbrainz_summary = summary.get("musicbrainz_summary", {})
+    if musicbrainz_summary and musicbrainz_summary.get("enabled"):
+        st.info(
+            f"MusicBrainz-validering: {musicbrainz_summary.get('checked', 0)} "
+            f"af {musicbrainz_summary.get('existing_music_total', 0)} Existing music-tracks blev tjekket."
+        )
+        for warning in musicbrainz_summary.get("warnings", []):
+            st.warning(warning)
+
+    preview_rows = summary.get("preview_rows", [])
+    if preview_rows:
+        st.subheader("Preview af musikdata")
+        st.dataframe(
+            preview_rows,
+            hide_index=True,
+            use_container_width=True,
+        )
+        if len(preview_rows) >= 500:
+            st.caption("Previewet viser de første 500 linjer for at holde appen hurtig.")
+
     st.download_button(
         label=st.session_state.get("download_label", "⬇️ Download fil"),
         data=st.session_state["finished_file_bytes"],
@@ -1927,7 +2514,8 @@ Appen gør følgende:
 8. Splitter **Music Duration** til minutter og sekunder.
 9. Oversætter **Music Source** til skabelonens track types.
 10. Samler automatisk gentagne bumpers/vignetter, hvis land/produktionstype kræver det.
-11. Skriver værdierne ind i de eksisterende celler i skabelonen.
-12. Giver dig enten én færdig Excel-fil, én samlet musikrapport med alle tracks i samme tabel eller en ZIP-fil med én Excel-rapport pr. fane direkte i browseren.
+11. Kan valgfrit slå Existing music-tracks op i MusicBrainz og vise en **Data Match**-kolonne i previewet.
+12. Skriver værdierne ind i de eksisterende celler i skabelonen.
+13. Giver dig enten én færdig Excel-fil, én samlet musikrapport med alle tracks i samme tabel eller en ZIP-fil med én Excel-rapport pr. fane direkte i browseren.
 """
     )
