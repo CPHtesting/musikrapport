@@ -40,15 +40,18 @@ st.title("🎵 Musikrapport → TV application")
 st.markdown(
     """
 Upload først NCB-skabelonen **tv-appl-en.xlsx** og derefter musikrapport-exporten.
+Vælg derefter **land** og **produktionstype**, så appen kan bruge de relevante
+NCB-regler for rapporteringen.
+
 Når kildefilen er uploadet, finder appen automatisk alle faner. Du kan enten vælge
 én bestemt fane eller udtrække alle faner på én gang.
 
-Hvis du vælger alle faner, kan du nu selv vælge mellem:
+Hvis du vælger alle faner, kan du vælge mellem:
 - **Samlet musikrapport**: én Excel-fil med alle tracks samlet i den samme Music content-tabel.
 - **Én musikrapport pr. fane**: en ZIP-fil med én separat Excel-rapport pr. kildefane.
 
-Appen skriver kun værdier ind i de relevante celler og bevarer skabelonens layout,
-kolonnebredder og formatering.
+Appen kan også automatisk samle gentagne **bumpers/vignetter** — fx norske bumpers —
+så én gentaget bumper bliver skrevet som ét samlet linjeelement med “x antal”.
 """
 )
 
@@ -504,6 +507,376 @@ def translate_track_type(value) -> str:
     return safe_text(value)
 
 
+
+# ------------------------------------------------------------
+# 8. LANDE, PRODUKTIONSTYPER OG SMART RAPPORT-REGLER
+# ------------------------------------------------------------
+
+COUNTRY_CONFIG = {
+    "Danmark": {
+        "territory": "Denmark / Nordic region",
+        "production_types": [
+            "TV-produktion",
+            "Live on tape",
+            "Fiktionsserie (Norden)",
+            "Fiktionsserie (udenfor Norden)",
+            "Koncert",
+            "Vignet og bumper",
+            "Trailer",
+            "TV-reklame",
+            "Reklame & trailers",
+            "Spillefilm",
+            "Kortfilm & dokumentar - biograf",
+            "Kortfilm & dokumentar - festival/TV/online",
+            "Fysiske kopier - AV-produktioner",
+        ],
+        "rule_note": "Danmark: Vignet og bumper ligger i samme kategori. Bestillingsmusik er angivet pr. episode; eksisterende musik forhandles direkte.",
+    },
+    "Finland": {
+        "territory": "Finland / Nordic region",
+        "production_types": [
+            "Muut TV-ohjelmat / andre TV-programmer",
+            "Live on tape",
+            "TV-drama (Norden)",
+            "TV-drama (udenfor Norden)",
+            "Koncertoptagelse",
+            "Tunnus- ja bumpermusiikki / signature og bumper",
+            "Reklamer, trailers og promos",
+            "Feature film",
+            "Short film - theatrical",
+            "Short film - festival/TV/online",
+            "Documentary - theatrical",
+            "Documentary - TV/festival/online",
+            "Fysiske kopier - audiovisuelle optagelser",
+        ],
+        "rule_note": "Finland: Signature-/bumpermusik er samlet i én kategori. Eksisterende musik forhandles direkte; bestillingsmusik er angivet pr. musiksekund.",
+    },
+    "Island": {
+        "territory": "Iceland / Nordic region",
+        "production_types": [
+            "TV production",
+            "Live on tape",
+            "TV drama (Norden)",
+            "TV drama (udenfor Norden)",
+            "Concert recording",
+            "Signature and bumper",
+            "TV trailer",
+            "TV commercial / TV promo",
+            "Commercial / promo & trailer",
+            "Feature film",
+            "Short film & documentary - theatrical",
+            "Short film & documentary - non-theatrical",
+            "Physical copies - audiovisual productions",
+        ],
+        "rule_note": "Island: Signature and bumper er én kategori og forhandles direkte med rettighedshaver.",
+    },
+    "Norge": {
+        "territory": "Norway / Nordic region",
+        "production_types": [
+            "TV-produksjon",
+            "Live on tape",
+            "TV-drama (Norden)",
+            "TV-drama (udenfor Norden)",
+            "Konsert",
+            "Vignett",
+            "Bumper",
+            "Trailer & TV-reklame",
+            "Spillefilm",
+            "Kortfilm - kinodistribusjon",
+            "Kortfilm - TV/festival/annen visning",
+            "Dokumentar - kinodistribusjon",
+            "Dokumentar - TV/festival/annen visning",
+            "Fysiske kopier - AV-produksjoner",
+        ],
+        "rule_note": "Norge: Vignett og Bumper er separate kategorier. Appen kan derfor automatisk samle gentagne bumpers/vignetter og markere dem med x antal.",
+    },
+    "Sverige": {
+        "territory": "Sweden / Nordic region",
+        "production_types": [
+            "TV-produktion",
+            "Live on tape",
+            "TV-drama (Norden)",
+            "TV-drama (udenfor Norden)",
+            "Koncerter",
+            "Vinjett & bumper",
+            "TV-trailer",
+            "TV-reklam",
+            "Reklam & trailer",
+            "Spelfilm",
+            "Kortfilm & dokumentär - biograf",
+            "Kortfilm & dokumentär - uden biografvisning",
+            "Fysiske kopier - AV-produktioner",
+        ],
+        "rule_note": "Sverige: Vinjett & bumper er én kategori og forhandles direkte med rettighedshaver.",
+    },
+}
+
+
+def get_country_names():
+    """Returnerer landene i den rækkefølge, de skal vises i brugerfladen."""
+    return list(COUNTRY_CONFIG.keys())
+
+
+def get_production_types_for_country(country: str) -> list[str]:
+    """Finder produktionstyperne for det valgte land."""
+    return COUNTRY_CONFIG.get(country, COUNTRY_CONFIG["Danmark"])["production_types"]
+
+
+def seconds_from_song(song: dict) -> int:
+    """
+    Regner en sangs Min/Sec om til totale sekunder.
+
+    Det gør det muligt at samle 12 ens bumpers til én linje med samlet varighed.
+    """
+    minutes = song.get("Min") or 0
+    seconds = song.get("Sec") or 0
+
+    try:
+        return int(minutes) * 60 + int(seconds)
+    except Exception:
+        return 0
+
+
+def min_sec_from_seconds(total_seconds: int):
+    """Konverterer totale sekunder tilbage til Min/Sec-kolonnerne."""
+    total_seconds = max(0, int(total_seconds or 0))
+    return total_seconds // 60, total_seconds % 60
+
+
+def clean_title_for_grouping(title: str) -> str:
+    """
+    Rydder titel op, så små forskelle ikke ødelægger samlingen.
+
+    Eksempel:
+    "03 BUMPER TO COMMERCIAL BREAK" og "03 Bumper To Commercial Break"
+    bliver behandlet som samme titel.
+    """
+    text = safe_text(title)
+    text = re.sub(r"\s+x\s*\d+\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def detect_report_category(song: dict, selected_country: str, production_type: str) -> str:
+    """
+    Gætter på om et track er almindelig musik, bumper eller vignette.
+
+    Vi bruger både den valgte produktionstype, sangtitel og Music Usage.
+    Det er især nyttigt i norske rapporter, hvor Vignett og Bumper har hver sin regel.
+    """
+    title = normalize_text(song.get("Song title"))
+    usage = normalize_text(song.get("Music Usage"))
+    production = normalize_text(production_type)
+
+    # Hvis brugeren direkte har valgt Bumper/Vignett som produktionstype,
+    # behandler vi alle tracks som den type.
+    if "bumper" in production and not any(word in production for word in ["vign", "vinjett", "signature", "tunnus"]):
+        return "Bumper"
+
+    if any(word in production for word in ["vignett", "vignet", "vinjett", "signature", "tunnus"] ) and "bumper" not in production:
+        return "Vignette"
+
+    # Automatisk genkendelse ud fra titel.
+    bumper_words = [
+        "bumper",
+        "bumpers",
+        "commercial break",
+        "reklamepause",
+        "reklamepauser",
+        "reklampaus",
+    ]
+    if any(word in title for word in bumper_words):
+        return "Bumper"
+
+    vignette_words = [
+        "vignett",
+        "vignet",
+        "vinjett",
+        "signature",
+        "theme",
+        "kjenningsmelodi",
+        "kendingsmelodi",
+        "tunnus",
+        "opening theme",
+        "closing theme",
+    ]
+    if any(word in title for word in vignette_words) or usage in ["opening theme", "closing theme"]:
+        return "Vignette"
+
+    return "Music"
+
+
+def should_aggregate_song(song: dict, selected_country: str, production_type: str, auto_group_special: bool) -> tuple[bool, str]:
+    """
+    Beslutter om et track skal samles med andre ens tracks.
+
+    Appens hovedregel:
+    - Bumpers/vignetter kan samles, fordi de ofte gentages mange gange.
+    - Almindelig musik samles ikke automatisk, da hvert cue normalt skal stå for sig.
+    - Norge får særlig opmærksomhed, fordi Vignett og Bumper er separate regler.
+    """
+    if not auto_group_special:
+        return False, "Music"
+
+    category = detect_report_category(song, selected_country, production_type)
+    production = normalize_text(production_type)
+    country = normalize_text(selected_country)
+
+    # Hvis produktionstypen selv er en bumper-/vignette-kategori, samler vi.
+    if any(word in production for word in ["bumper", "vign", "vinjett", "signature", "tunnus"]):
+        if category == "Music":
+            category = "Vignette/Bumper"
+        return True, category
+
+    # Norsk special: Hvis en almindelig TV-rapport indeholder bumpers/vignetter,
+    # samles de automatisk, så uploadarbejdet bliver mindre manuelt.
+    if country == "norge" and category in ["Bumper", "Vignette"]:
+        return True, category
+
+    return False, category
+
+
+def format_aggregated_title(original_title: str, category: str, count: int) -> str:
+    """
+    Laver den titel, der skrives i rapporten for en samlet bumper/vignette.
+
+    Eksempel:
+    "03 BUMPER TO COMMERCIAL BREAK x 12"
+    "Bumper - THE VOICE OF... x 8"
+    """
+    title = clean_title_for_grouping(original_title)
+    lower_title = normalize_text(title)
+
+    if category == "Bumper" and "bumper" not in lower_title:
+        title = f"Bumper - {title}"
+    elif category == "Vignette" and not any(word in lower_title for word in ["vignett", "vignet", "vinjett", "signature", "theme", "tunnus"]):
+        title = f"Vignette - {title}"
+
+    if count > 1:
+        title = f"{title} x {count}"
+
+    return title
+
+
+def aggregate_repeated_special_music(songs: list[dict], selected_country: str, production_type: str, auto_group_special: bool = True):
+    """
+    Samler gentagne bumpers/vignetter efter land og produktionstype.
+
+    Gruppens nøgle er titel + artist + komponister + writers + track type + kategori.
+    Varigheden lægges sammen, og titlen får "x antal".
+    """
+    output = []
+    groups = {}
+    order = []
+    aggregated_original_rows = 0
+
+    for song in songs:
+        should_group, category = should_aggregate_song(
+            song=song,
+            selected_country=selected_country,
+            production_type=production_type,
+            auto_group_special=auto_group_special,
+        )
+
+        if not should_group:
+            output.append(song)
+            continue
+
+        key = (
+            category,
+            normalize_text(clean_title_for_grouping(song.get("Song title"))),
+            normalize_text(song.get("Artist")),
+            normalize_text(song.get("Composers")),
+            normalize_text(song.get("Writers")),
+            normalize_text(song.get("Track type")),
+        )
+
+        if key not in groups:
+            groups[key] = {
+                "base_song": dict(song),
+                "category": category,
+                "count": 0,
+                "seconds": 0,
+            }
+            order.append(key)
+
+        groups[key]["count"] += 1
+        groups[key]["seconds"] += seconds_from_song(song)
+        aggregated_original_rows += 1
+
+    # De samlede linjer lægges efter de almindelige tracks.
+    # Det gør dem lette at finde og indtaste i næste system.
+    for key in order:
+        group = groups[key]
+        song = dict(group["base_song"])
+        minutes, seconds = min_sec_from_seconds(group["seconds"])
+
+        song["Song title"] = format_aggregated_title(
+            original_title=song.get("Song title"),
+            category=group["category"],
+            count=group["count"],
+        )
+        song["Min"] = minutes
+        song["Sec"] = seconds
+        song["Aggregated count"] = group["count"]
+        song["Aggregated category"] = group["category"]
+
+        output.append(song)
+
+    collapsed_lines = max(0, aggregated_original_rows - len(groups))
+    warnings = []
+
+    if collapsed_lines > 0:
+        warnings.append(
+            f"{aggregated_original_rows} bumper-/vignette-linjer blev samlet til {len(groups)} linjer "
+            f"efter reglerne for {selected_country} / {production_type}."
+        )
+
+    return output, {
+        "aggregated_original_rows": aggregated_original_rows,
+        "aggregated_groups": len(groups),
+        "collapsed_lines": collapsed_lines,
+        "warnings": warnings,
+    }
+
+
+def apply_country_production_rules(songs: list[dict], selected_country: str, production_type: str, auto_group_special: bool = True):
+    """
+    Samlet regelmotor.
+
+    Lige nu gør den især én vigtig ting:
+    - Den samler gentagne bumpers/vignetter, når land/produktionstype peger på det.
+
+    Funktionen returnerer både de bearbejdede sange og en lille summary til UI'et.
+    """
+    processed_songs, rule_summary = aggregate_repeated_special_music(
+        songs=songs,
+        selected_country=selected_country,
+        production_type=production_type,
+        auto_group_special=auto_group_special,
+    )
+
+    rule_summary["country"] = selected_country
+    rule_summary["production_type"] = production_type
+    rule_summary["auto_group_special"] = auto_group_special
+
+    return processed_songs, rule_summary
+
+
+def write_report_context_to_template(template_ws, selected_country: str, production_type: str):
+    """
+    Skriver land og produktionstype ind i skabelonen, hvis felterne findes.
+
+    Skabelonen har fx "Production category" og "Territory".
+    Hvis en fremtidig skabelon ikke har felterne, springer funktionen bare over.
+    """
+    country_config = COUNTRY_CONFIG.get(selected_country, {})
+    territory = country_config.get("territory", selected_country)
+
+    write_optional_metadata_value(template_ws, "Production category", production_type)
+    write_optional_metadata_value(template_ws, "Territory", territory)
+
+
 # ------------------------------------------------------------
 # 8. UDTRÆK MUSIKDATA FRA KILDEFILEN
 # ------------------------------------------------------------
@@ -528,6 +901,7 @@ def extract_music_rows(source_ws) -> list[dict]:
     col_title = get_col(header_map, ["Music Title"])
     col_duration = get_col(header_map, ["Music Duration"])
     col_source = get_col(header_map, ["Music Source"])
+    col_usage = get_col(header_map, ["Music Usage"], required=False)
 
     # Ikke alle fremtidige exports er nødvendigvis helt ens,
     # så disse tre gøres ikke hårdt påkrævede.
@@ -556,6 +930,7 @@ def extract_music_rows(source_ws) -> list[dict]:
             "title": source_ws.cell(row=row_number, column=col_title).value,
             "duration": source_ws.cell(row=row_number, column=col_duration).value,
             "source": source_ws.cell(row=row_number, column=col_source).value,
+            "usage": source_ws.cell(row=row_number, column=col_usage).value if col_usage else None,
             "performer": source_ws.cell(row=row_number, column=col_performer).value if col_performer else None,
             "role": source_ws.cell(row=row_number, column=col_role).value if col_role else None,
             "name": source_ws.cell(row=row_number, column=col_name).value if col_name else None,
@@ -592,6 +967,11 @@ def extract_music_rows(source_ws) -> list[dict]:
         duration = next(
             (row["duration"] for row in rows if not is_empty(row["duration"])),
             None
+        )
+
+        usage = next(
+            (safe_text(row["usage"]) for row in rows if not is_empty(row.get("usage"))),
+            ""
         )
 
         source = next(
@@ -648,6 +1028,7 @@ def extract_music_rows(source_ws) -> list[dict]:
                 "Min": minutes,
                 "Sec": seconds,
                 "Track type": translate_track_type(source),
+                "Music Usage": usage,
             }
         )
 
@@ -848,7 +1229,14 @@ def get_sheet_names(source_file_bytes: bytes) -> list[str]:
     return workbook.sheetnames
 
 
-def process_files(template_file_bytes: bytes, source_file_bytes: bytes, selected_sheet: str):
+def process_files(
+    template_file_bytes: bytes,
+    source_file_bytes: bytes,
+    selected_sheet: str,
+    selected_country: str,
+    production_type: str,
+    auto_group_special: bool = True,
+):
     """
     Hele databehandlingen samlet ét sted.
 
@@ -877,6 +1265,16 @@ def process_files(template_file_bytes: bytes, source_file_bytes: bytes, selected
     metadata = extract_metadata(source_ws)
     songs = extract_music_rows(source_ws)
 
+    original_song_count = len(songs)
+
+    # Brug land + produktionstype til at anvende de relevante rapportregler.
+    songs, rule_summary = apply_country_production_rules(
+        songs=songs,
+        selected_country=selected_country,
+        production_type=production_type,
+        auto_group_special=auto_group_special,
+    )
+
     # Åbn skabelonen
     template_wb = load_workbook(
         io.BytesIO(template_file_bytes),
@@ -892,7 +1290,11 @@ def process_files(template_file_bytes: bytes, source_file_bytes: bytes, selected
 
     # Skriv data ind i skabelonen
     write_metadata_to_template(template_ws, metadata)
+    write_report_context_to_template(template_ws, selected_country, production_type)
     write_result = write_music_to_template(template_ws, songs)
+
+    # Læg regelmotorens advarsler sammen med Excel-skrivningens advarsler.
+    write_result["warnings"] = rule_summary.get("warnings", []) + write_result.get("warnings", [])
 
     # Gem workbook i hukommelsen i stedet for på disk.
     # Det gør, at Streamlit kan sende filen direkte til download-knappen.
@@ -903,7 +1305,11 @@ def process_files(template_file_bytes: bytes, source_file_bytes: bytes, selected
     summary = {
         "selected_sheet": selected_sheet,
         "metadata": metadata,
-        "song_count_found": len(songs),
+        "country": selected_country,
+        "production_type": production_type,
+        "rule_summary": rule_summary,
+        "song_count_found": original_song_count,
+        "song_count_after_rules": len(songs),
         "song_count_written": write_result["written_count"],
         "song_count_skipped": write_result["skipped_count"],
         "template_capacity": write_result["capacity"],
@@ -953,7 +1359,14 @@ def write_optional_metadata_value(template_ws, target_label: str, value):
         target_cell.value = value
 
 
-def process_all_sheets_combined(template_file_bytes: bytes, source_file_bytes: bytes, sheet_names: list[str]):
+def process_all_sheets_combined(
+    template_file_bytes: bytes,
+    source_file_bytes: bytes,
+    sheet_names: list[str],
+    selected_country: str,
+    production_type: str,
+    auto_group_special: bool = True,
+):
     """
     Behandler alle faner og samler ALLE tracks i ÉN musikrapport.
 
@@ -1029,6 +1442,17 @@ def process_all_sheets_combined(template_file_bytes: bytes, source_file_bytes: b
             f"De første fejl var: {error_text}"
         )
 
+    original_all_song_count = len(all_songs)
+
+    # Når alle tracks er samlet fra alle faner, kan vi samle gentagne bumpers/vignetter
+    # på tværs af hele uploadet. Det er især nyttigt for fx norske bumpers.
+    all_songs, rule_summary = apply_country_production_rules(
+        songs=all_songs,
+        selected_country=selected_country,
+        production_type=production_type,
+        auto_group_special=auto_group_special,
+    )
+
     # Åbn skabelonen
     template_wb = load_workbook(
         io.BytesIO(template_file_bytes),
@@ -1049,12 +1473,14 @@ def process_all_sheets_combined(template_file_bytes: bytes, source_file_bytes: b
     combined_metadata["Episode number"] = "All uploaded sheets"
 
     write_metadata_to_template(template_ws, combined_metadata)
+    write_report_context_to_template(template_ws, selected_country, production_type)
     write_optional_metadata_value(template_ws, "Total number of episodes", len(summaries))
 
     # Skriv ALLE tracks ind i den samme Music content-tabel.
     write_result = write_music_to_template(template_ws, all_songs, allow_expand=True)
 
-    # Tilføj eventuelle warnings fra selve skrivningen til summary.
+    # Tilføj eventuelle warnings fra regelmotoren og selve skrivningen til summary.
+    write_result["warnings"] = rule_summary.get("warnings", []) + write_result.get("warnings", [])
     for warning in write_result["warnings"]:
         summaries[0].setdefault("warnings", []).append(warning)
 
@@ -1069,7 +1495,11 @@ def process_all_sheets_combined(template_file_bytes: bytes, source_file_bytes: b
         "summaries": summaries,
         "errors": errors,
         "metadata": combined_metadata,
-        "song_count_found": len(all_songs),
+        "country": selected_country,
+        "production_type": production_type,
+        "rule_summary": rule_summary,
+        "song_count_found": original_all_song_count,
+        "song_count_after_rules": len(all_songs),
         "song_count_written": write_result["written_count"],
         "song_count_skipped": write_result["skipped_count"],
         "template_capacity": write_result["capacity"],
@@ -1078,7 +1508,14 @@ def process_all_sheets_combined(template_file_bytes: bytes, source_file_bytes: b
 
     return output.getvalue(), summary
 
-def process_all_sheets_separate_files(template_file_bytes: bytes, source_file_bytes: bytes, sheet_names: list[str]):
+def process_all_sheets_separate_files(
+    template_file_bytes: bytes,
+    source_file_bytes: bytes,
+    sheet_names: list[str],
+    selected_country: str,
+    production_type: str,
+    auto_group_special: bool = True,
+):
     """
     Behandler alle faner og laver én separat Excel-rapport pr. fane.
 
@@ -1097,6 +1534,9 @@ def process_all_sheets_separate_files(template_file_bytes: bytes, source_file_by
                     template_file_bytes=template_file_bytes,
                     source_file_bytes=source_file_bytes,
                     selected_sheet=sheet_name,
+                    selected_country=selected_country,
+                    production_type=production_type,
+                    auto_group_special=auto_group_special,
                 )
 
                 output_filename = f"tv-appl-en_udfyldt_{safe_filename(sheet_name)}.xlsx"
@@ -1127,13 +1567,37 @@ def process_all_sheets_separate_files(template_file_bytes: bytes, source_file_by
 
     zip_buffer.seek(0)
 
+    total_aggregated_original_rows = sum(
+        item.get("rule_summary", {}).get("aggregated_original_rows", 0)
+        for item in summaries
+    )
+    total_aggregated_groups = sum(
+        item.get("rule_summary", {}).get("aggregated_groups", 0)
+        for item in summaries
+    )
+    total_collapsed_lines = sum(
+        item.get("rule_summary", {}).get("collapsed_lines", 0)
+        for item in summaries
+    )
+
     summary = {
         "mode": "separate_files",
         "processed_count": len(summaries),
         "error_count": len(errors),
         "summaries": summaries,
         "errors": errors,
+        "country": selected_country,
+        "production_type": production_type,
+        "rule_summary": {
+            "aggregated_original_rows": total_aggregated_original_rows,
+            "aggregated_groups": total_aggregated_groups,
+            "collapsed_lines": total_collapsed_lines,
+            "country": selected_country,
+            "production_type": production_type,
+            "auto_group_special": auto_group_special,
+        },
         "song_count_found": sum(item.get("song_count_found", 0) for item in summaries),
+        "song_count_after_rules": sum(item.get("song_count_after_rules", item.get("song_count_found", 0)) for item in summaries),
         "song_count_written": sum(item.get("song_count_written", 0) for item in summaries),
         "song_count_skipped": sum(item.get("song_count_skipped", 0) for item in summaries),
     }
@@ -1176,6 +1640,32 @@ with col2:
     )
 
 
+st.subheader("3. Land og produktionstype")
+selected_country = st.selectbox(
+    "Vælg land / NCB-prisliste",
+    options=get_country_names(),
+    index=get_country_names().index("Norge") if "Norge" in get_country_names() else 0,
+    help="Landet bestemmer hvilke rapporteringsregler og produktionstyper, der vises.",
+)
+
+selected_production_type = st.selectbox(
+    "Vælg produktionstype",
+    options=get_production_types_for_country(selected_country),
+    index=0,
+    help="Produktionstypen bruges til at vælge de rigtige automatiske rapportregler.",
+)
+
+auto_group_special = st.checkbox(
+    "Saml automatisk ens bumpers/vignetter",
+    value=True,
+    help=(
+        "Når denne er slået til, samler appen gentagne bumpers/vignetter til én linje "
+        "med fx 'x 12'. Det er især relevant for norske rapporter."
+    ),
+)
+
+st.info(COUNTRY_CONFIG[selected_country]["rule_note"])
+
 selected_sheet = None
 process_mode = None
 export_mode = None
@@ -1190,7 +1680,7 @@ if source_file is not None:
             st.caption(f"Fandt {len(sheet_names)} faner i kildefilen.")
 
             process_mode = st.radio(
-                "3. Hvad vil du udtrække?",
+                "4. Hvad vil du udtrække?",
                 options=["Én valgt fane", "Alle faner"],
                 horizontal=True,
             )
@@ -1203,7 +1693,7 @@ if source_file is not None:
                 )
             else:
                 export_mode = st.radio(
-                    "4. Hvordan vil du eksportere alle faner?",
+                    "5. Hvordan vil du eksportere alle faner?",
                     options=["Samlet musikrapport", "Én musikrapport pr. fane"],
                     horizontal=False,
                     help=(
@@ -1245,6 +1735,8 @@ button_disabled = (
     template_file is None
     or source_file is None
     or not sheet_names
+    or selected_country is None
+    or selected_production_type is None
     or process_mode is None
     or (process_mode == "Én valgt fane" and selected_sheet is None)
     or (process_mode == "Alle faner" and export_mode is None)
@@ -1261,6 +1753,9 @@ if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
                     template_file_bytes=template_bytes,
                     source_file_bytes=source_bytes,
                     sheet_names=sheet_names,
+                    selected_country=selected_country,
+                    production_type=selected_production_type,
+                    auto_group_special=auto_group_special,
                 )
                 output_filename = "tv-appl-en_samlet_musikrapport_alle_tracks.xlsx"
                 download_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -1271,6 +1766,9 @@ if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
                     template_file_bytes=template_bytes,
                     source_file_bytes=source_bytes,
                     sheet_names=sheet_names,
+                    selected_country=selected_country,
+                    production_type=selected_production_type,
+                    auto_group_special=auto_group_special,
                 )
                 output_filename = "tv-appl-en_rapporter_pr_fane.zip"
                 download_mime = "application/zip"
@@ -1281,6 +1779,9 @@ if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
                     template_file_bytes=template_bytes,
                     source_file_bytes=source_bytes,
                     selected_sheet=selected_sheet,
+                    selected_country=selected_country,
+                    production_type=selected_production_type,
+                    auto_group_special=auto_group_special,
                 )
                 summary["mode"] = "single"
                 output_filename = f"tv-appl-en_udfyldt_{safe_filename(selected_sheet)}.xlsx"
@@ -1319,6 +1820,8 @@ if "finished_file_bytes" in st.session_state:
 
     if summary.get("mode") in ["combined", "separate_files"]:
         st.write("**Udtræk:** Alle faner")
+        st.write(f"**Land:** {summary.get('country', '')}")
+        st.write(f"**Produktionstype:** {summary.get('production_type', '')}")
 
         if summary.get("mode") == "combined":
             st.write("**Eksport:** Samlet musikrapport — én Excel-fil med alle tracks samlet i samme Music content-tabel")
@@ -1368,6 +1871,8 @@ if "finished_file_bytes" in st.session_state:
 
     else:
         st.write(f"**Valgt fane:** {summary.get('selected_sheet', '')}")
+        st.write(f"**Land:** {summary.get('country', '')}")
+        st.write(f"**Produktionstype:** {summary.get('production_type', '')}")
         st.write(f"**Musiknumre fundet i kildefilen:** {summary.get('song_count_found', 0)}")
         st.write(f"**Musiknumre skrevet i skabelonen:** {summary.get('song_count_written', 0)}")
 
@@ -1381,6 +1886,14 @@ if "finished_file_bytes" in st.session_state:
         metadata = summary.get("metadata", {})
         with st.expander("Se metadata, der blev overført"):
             st.write(metadata)
+
+    rule_summary = summary.get("rule_summary", {})
+    if rule_summary and rule_summary.get("collapsed_lines", 0) > 0:
+        st.success(
+            f"Smart-regel brugt: {rule_summary.get('aggregated_original_rows', 0)} "
+            f"bumper-/vignette-linjer blev samlet til "
+            f"{rule_summary.get('aggregated_groups', 0)} linjer."
+        )
 
     st.download_button(
         label=st.session_state.get("download_label", "⬇️ Download fil"),
@@ -1401,18 +1914,20 @@ with st.expander("Hvad gør appen helt præcist?"):
 Appen gør følgende:
 
 1. Læser alle faner i kildefilen.
-2. Lader dig vælge enten én fane eller alle faner.
-3. Finder metadatafelterne:
+2. Lader dig vælge land og produktionstype.
+3. Lader dig vælge enten én fane eller alle faner.
+4. Finder metadatafelterne:
    - Production Company
    - Production Title
    - Episode Number
    - Network/Station
-4. Finder tabellen med musikdata via kolonnen **Seq #**.
-5. Grupperer linjerne under hver sang, så komponister/forfattere tilhører den rigtige sang.
-6. Udtrækker efternavne og fjerner foreningskoder som `[PRS]`, `[BMI]` og `(BMI)`.
-7. Splitter **Music Duration** til minutter og sekunder.
-8. Oversætter **Music Source** til skabelonens track types.
-9. Skriver værdierne ind i de eksisterende celler i skabelonen.
-10. Giver dig enten én færdig Excel-fil, én samlet musikrapport med alle tracks i samme tabel eller en ZIP-fil med én Excel-rapport pr. fane direkte i browseren.
+5. Finder tabellen med musikdata via kolonnen **Seq #**.
+6. Grupperer linjerne under hver sang, så komponister/forfattere tilhører den rigtige sang.
+7. Udtrækker efternavne og fjerner foreningskoder som `[PRS]`, `[BMI]` og `(BMI)`.
+8. Splitter **Music Duration** til minutter og sekunder.
+9. Oversætter **Music Source** til skabelonens track types.
+10. Samler automatisk gentagne bumpers/vignetter, hvis land/produktionstype kræver det.
+11. Skriver værdierne ind i de eksisterende celler i skabelonen.
+12. Giver dig enten én færdig Excel-fil, én samlet musikrapport med alle tracks i samme tabel eller en ZIP-fil med én Excel-rapport pr. fane direkte i browseren.
 """
     )
