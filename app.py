@@ -18,6 +18,7 @@ import re
 import traceback
 import unicodedata
 import zipfile
+from copy import copy
 from datetime import datetime, time, timedelta
 
 import streamlit as st
@@ -43,7 +44,7 @@ Når kildefilen er uploadet, finder appen automatisk alle faner. Du kan enten v�
 én bestemt fane eller udtrække alle faner på én gang.
 
 Hvis du vælger alle faner, kan du nu selv vælge mellem:
-- **Samlet musikrapport**: én Excel-fil med én udfyldt fane pr. kildefane.
+- **Samlet musikrapport**: én Excel-fil med alle tracks samlet i den samme Music content-tabel.
 - **Én musikrapport pr. fane**: en ZIP-fil med én separat Excel-rapport pr. kildefane.
 
 Appen skriver kun værdier ind i de relevante celler og bevarer skabelonens layout,
@@ -698,43 +699,116 @@ def write_metadata_to_template(template_ws, metadata: dict):
         target_cell.value = value
 
 
-def write_music_to_template(template_ws, songs: list[dict]) -> dict:
+def copy_row_format(ws, source_row: int, target_row: int):
+    """
+    Kopierer kun formatering fra én række til en anden række.
+
+    Det bruges, når en samlet rapport har flere tracks end de tomme rækker,
+    skabelonen oprindeligt har. Vi ændrer ikke eksisterende rækker eller
+    kolonner; vi fortsætter bare Music content-tabellen nedad og kopierer
+    samme visuelle stil som skabelonens sidste musikrække.
+    """
+    ws.row_dimensions[target_row].height = ws.row_dimensions[source_row].height
+
+    for col_index in range(1, ws.max_column + 1):
+        source_cell = ws.cell(row=source_row, column=col_index)
+        target_cell = ws.cell(row=target_row, column=col_index)
+
+        if source_cell.has_style:
+            target_cell._style = copy(source_cell._style)
+
+        if source_cell.number_format:
+            target_cell.number_format = source_cell.number_format
+
+        if source_cell.protection:
+            target_cell.protection = copy(source_cell.protection)
+
+        if source_cell.alignment:
+            target_cell.alignment = copy(source_cell.alignment)
+
+        # Vi kopierer ikke værdier. De nye celler skal være tomme,
+        # indtil musikdata skrives ind.
+        target_cell.value = None
+
+
+def ensure_music_capacity(template_ws, first_data_row: int, needed_rows: int):
+    """
+    Sørger for, at Music content-tabellen har nok rækker til alle tracks.
+
+    Skabelonen har normalt et fast antal tomme rækker. Ved en samlet rapport
+    med alle faner kan der være flere tracks end det. Derfor udvider vi kun
+    nederst i Music content-området og kopierer formateringen fra sidste
+    eksisterende musikrække.
+    """
+    current_capacity = template_ws.max_row - first_data_row + 1
+
+    if needed_rows <= current_capacity:
+        return current_capacity
+
+    source_format_row = template_ws.max_row
+    final_row_needed = first_data_row + needed_rows - 1
+
+    for row_number in range(template_ws.max_row + 1, final_row_needed + 1):
+        copy_row_format(template_ws, source_format_row, row_number)
+
+    return needed_rows
+
+
+def write_music_to_template(template_ws, songs: list[dict], allow_expand: bool = False) -> dict:
     """
     Skriver musikdata ind i Music content-tabellen.
 
-    Vigtigt:
-    - Der indsættes ikke nye rækker.
-    - Der ændres ikke formatering.
-    - Der skrives kun i eksisterende celler i de fundne music-kolonner.
+    Standardadfærd:
+    - Ved én valgt fane og "én rapport pr. fane" skrives der kun i de
+      eksisterende rækker i skabelonen.
+
+    Samlet rapport:
+    - Når allow_expand=True, udvider appen Music content-tabellen nedad, hvis
+      der er flere tracks end de eksisterende tomme rækker. Den kopierer kun
+      formateringen fra skabelonens sidste musikrække.
     """
     header_row, columns = find_template_music_columns(template_ws)
     first_data_row = header_row + 1
 
-    # Antal eksisterende rækker i skabelonen, som vi må skrive i.
-    # Vi bruger max_row, fordi det er den struktur, skabelonen allerede har.
-    capacity = template_ws.max_row - first_data_row + 1
-
     warnings = []
 
-    if capacity <= 0:
+    original_capacity = template_ws.max_row - first_data_row + 1
+
+    if original_capacity <= 0:
         raise ValueError("Skabelonen har ingen tomme rækker under Music content-headeren.")
+
+    if allow_expand:
+        capacity = ensure_music_capacity(
+            template_ws=template_ws,
+            first_data_row=first_data_row,
+            needed_rows=len(songs),
+        )
+        skipped_count = 0
+        songs_to_write = songs
+
+        if len(songs) > original_capacity:
+            warnings.append(
+                f"Music content-tabellen blev udvidet fra {original_capacity} til {len(songs)} rækker, "
+                "så alle tracks fra alle faner kunne komme med i én samlet rapport."
+            )
+    else:
+        capacity = original_capacity
+        songs_to_write = songs[:capacity]
+        skipped_count = max(0, len(songs) - capacity)
+
+        if skipped_count > 0:
+            warnings.append(
+                f"Der var {len(songs)} musiknumre i kilden, men skabelonen har kun "
+                f"plads til {capacity} eksisterende rækker. "
+                f"{skipped_count} musiknumre blev derfor ikke skrevet ind. "
+                f"Appen indsætter ikke nye rækker i denne eksportform."
+            )
 
     # Ryd kun gamle værdier i de relevante musik-kolonner.
     # Dette ændrer ikke formatering, kolonnebredder eller layout.
-    for row_number in range(first_data_row, template_ws.max_row + 1):
+    for row_number in range(first_data_row, first_data_row + capacity):
         for col_index in columns.values():
             template_ws.cell(row=row_number, column=col_index).value = None
-
-    songs_to_write = songs[:capacity]
-    skipped_count = max(0, len(songs) - capacity)
-
-    if skipped_count > 0:
-        warnings.append(
-            f"Der var {len(songs)} musiknumre i kilden, men skabelonen har kun "
-            f"plads til {capacity} eksisterende rækker. "
-            f"{skipped_count} musiknumre blev derfor ikke skrevet ind. "
-            f"Appen indsætter ikke nye rækker, fordi det ville ændre skabelonens struktur."
-        )
 
     # Skriv sangene ind i skabelonen
     for index, song in enumerate(songs_to_write):
@@ -866,65 +940,33 @@ def make_unique_zip_name(filename: str, used_names: set[str]) -> str:
         counter += 1
 
 
-def safe_sheet_title(text: str) -> str:
+def write_optional_metadata_value(template_ws, target_label: str, value):
     """
-    Gør et fanenavn sikkert som Excel-arknavn.
+    Skriver et valgfrit metadatafelt, hvis feltet findes i skabelonen.
 
-    Excel tillader ikke disse tegn i arknavne:
-    [ ] : * ? / \\
-
-    Excel-arknavne må heller ikke være længere end 31 tegn.
+    Bruges fx til "Total number of episodes" i en samlet rapport.
+    Hvis feltet ikke findes, springer appen bare videre uden at crashe.
     """
-    text = safe_text(text)
+    target_cell = find_cell_right_of_label(template_ws, [target_label])
 
-    # Fjern ugyldige Excel-tegn
-    text = re.sub(r"[\[\]:*?/\\]", "_", text)
-
-    # Ryd op i mellemrum og apostroffer
-    text = re.sub(r"\s+", " ", text).strip().strip("'")
-
-    if not text:
-        text = "Rapport"
-
-    return text[:31]
-
-
-def make_unique_sheet_title(title: str, used_titles: set[str]) -> str:
-    """
-    Sørger for, at fanenavne i en samlet Excel-fil er unikke.
-
-    Hvis to kildefaner fx begge ender med samme korte navn, laver vi:
-    - Episode 1
-    - Episode 1_2
-    """
-    base = safe_sheet_title(title)
-    candidate = base
-    counter = 2
-
-    while candidate in used_titles:
-        suffix = f"_{counter}"
-        candidate = f"{base[:31 - len(suffix)]}{suffix}"
-        counter += 1
-
-    used_titles.add(candidate)
-    return candidate
+    if target_cell is not None:
+        target_cell.value = value
 
 
 def process_all_sheets_combined(template_file_bytes: bytes, source_file_bytes: bytes, sheet_names: list[str]):
     """
-    Behandler alle faner og samler dem i ÉN Excel-fil.
+    Behandler alle faner og samler ALLE tracks i ÉN musikrapport.
 
-    Resultatet bliver én samlet musikrapport, hvor hver kildefane bliver til én
-    udfyldt fane i outputfilen.
+    Det betyder:
+    - Outputtet er én Excel-fil.
+    - Outputtet har stadig kun én Application-rapportfane fra skabelonen.
+    - Alle tracks fra alle valgte kildefaner skrives samlet ned i samme
+      Music content-tabel.
 
-    Eksempel:
-    - Kildefane: Episode 1  → Outputfane: Episode 1
-    - Kildefane: Episode 2  → Outputfane: Episode 2
-
-    Vigtigt:
-    Hver outputfane laves som en kopi af skabelonens Application-fane. Derefter
-    skriver appen kun værdier ind i kopien. Det betyder, at layout, formatering,
-    kolonnebredder og rækker bevares så tæt på 1:1 som muligt.
+    Hvis der er flere tracks end skabelonens oprindelige tomme rækker, udvider
+    appen Music content-området nedad og kopierer formateringen fra sidste
+    eksisterende musikrække. Det er nødvendigt for at få alle tracks med i én
+    samlet rapport.
     """
     # Åbn kildefilen én gang
     source_wb = load_workbook(
@@ -933,22 +975,10 @@ def process_all_sheets_combined(template_file_bytes: bytes, source_file_bytes: b
         data_only=True,
     )
 
-    # Åbn skabelonen én gang
-    template_wb = load_workbook(
-        io.BytesIO(template_file_bytes),
-        read_only=False,
-        data_only=False,
-    )
-
-    # Find den fane i skabelonen, som skal kopieres for hver rapport
-    if "Application" in template_wb.sheetnames:
-        base_ws = template_wb["Application"]
-    else:
-        base_ws = template_wb.active
-
+    all_songs = []
     summaries = []
     errors = []
-    used_sheet_titles = set(template_wb.sheetnames)
+    first_metadata = None
 
     for sheet_name in sheet_names:
         try:
@@ -961,24 +991,22 @@ def process_all_sheets_combined(template_file_bytes: bytes, source_file_bytes: b
             metadata = extract_metadata(source_ws)
             songs = extract_music_rows(source_ws)
 
-            # Lav en frisk kopi af skabelonfanen til netop denne kildefane
-            target_ws = template_wb.copy_worksheet(base_ws)
-            target_ws.title = make_unique_sheet_title(sheet_name, used_sheet_titles)
+            # Gem metadata fra første fane, der kan behandles.
+            # I samlede rapporter er Production company/title/broadcaster normalt ens
+            # på tværs af faner. Episode number ændrer vi længere nede.
+            if first_metadata is None:
+                first_metadata = metadata
 
-            # Skriv data ind i den kopierede skabelonfane
-            write_metadata_to_template(target_ws, metadata)
-            write_result = write_music_to_template(target_ws, songs)
+            all_songs.extend(songs)
 
             summaries.append(
                 {
                     "selected_sheet": sheet_name,
-                    "output_sheet": target_ws.title,
                     "metadata": metadata,
                     "song_count_found": len(songs),
-                    "song_count_written": write_result["written_count"],
-                    "song_count_skipped": write_result["skipped_count"],
-                    "template_capacity": write_result["capacity"],
-                    "warnings": write_result["warnings"],
+                    "song_count_written": len(songs),
+                    "song_count_skipped": 0,
+                    "warnings": [],
                 }
             )
 
@@ -1001,16 +1029,34 @@ def process_all_sheets_combined(template_file_bytes: bytes, source_file_bytes: b
             f"De første fejl var: {error_text}"
         )
 
-    # Fjern den oprindelige tomme skabelonfane, så outputtet kun indeholder
-    # de udfyldte rapportfaner. Vi gør det først til sidst, så vi hele tiden
-    # har en urørt base at kopiere fra.
-    if base_ws in template_wb.worksheets and len(template_wb.worksheets) > 1:
-        template_wb.remove(base_ws)
+    # Åbn skabelonen
+    template_wb = load_workbook(
+        io.BytesIO(template_file_bytes),
+        read_only=False,
+        data_only=False,
+    )
 
-    # Gør første udfyldte rapportfane aktiv, når filen åbnes i Excel.
-    first_output_sheet = summaries[0]["output_sheet"]
-    if first_output_sheet in template_wb.sheetnames:
-        template_wb.active = template_wb.sheetnames.index(first_output_sheet)
+    # Brug Application-fanen, hvis den findes. Ellers brug aktiv fane.
+    if "Application" in template_wb.sheetnames:
+        template_ws = template_wb["Application"]
+    else:
+        template_ws = template_wb.active
+
+    # Metadata til én samlet rapport:
+    # Vi bruger metadata fra første behandlede fane, men gør Episode number tydelig,
+    # så rapporten ikke ligner én enkelt episode.
+    combined_metadata = dict(first_metadata or {})
+    combined_metadata["Episode number"] = "All uploaded sheets"
+
+    write_metadata_to_template(template_ws, combined_metadata)
+    write_optional_metadata_value(template_ws, "Total number of episodes", len(summaries))
+
+    # Skriv ALLE tracks ind i den samme Music content-tabel.
+    write_result = write_music_to_template(template_ws, all_songs, allow_expand=True)
+
+    # Tilføj eventuelle warnings fra selve skrivningen til summary.
+    for warning in write_result["warnings"]:
+        summaries[0].setdefault("warnings", []).append(warning)
 
     output = io.BytesIO()
     template_wb.save(output)
@@ -1022,13 +1068,15 @@ def process_all_sheets_combined(template_file_bytes: bytes, source_file_bytes: b
         "error_count": len(errors),
         "summaries": summaries,
         "errors": errors,
-        "song_count_found": sum(item.get("song_count_found", 0) for item in summaries),
-        "song_count_written": sum(item.get("song_count_written", 0) for item in summaries),
-        "song_count_skipped": sum(item.get("song_count_skipped", 0) for item in summaries),
+        "metadata": combined_metadata,
+        "song_count_found": len(all_songs),
+        "song_count_written": write_result["written_count"],
+        "song_count_skipped": write_result["skipped_count"],
+        "template_capacity": write_result["capacity"],
+        "warnings": write_result["warnings"],
     }
 
     return output.getvalue(), summary
-
 
 def process_all_sheets_separate_files(template_file_bytes: bytes, source_file_bytes: bytes, sheet_names: list[str]):
     """
@@ -1159,7 +1207,8 @@ if source_file is not None:
                     options=["Samlet musikrapport", "Én musikrapport pr. fane"],
                     horizontal=False,
                     help=(
-                        "Samlet musikrapport giver én Excel-fil med én udfyldt fane pr. kildefane. "
+                        "Samlet musikrapport giver én Excel-fil, hvor alle tracks fra alle faner "
+                        "samles i den samme Music content-tabel. "
                         "Én musikrapport pr. fane giver en ZIP-fil med separate Excel-filer."
                     ),
                 )
@@ -1167,7 +1216,7 @@ if source_file is not None:
                 if export_mode == "Samlet musikrapport":
                     st.info(
                         f"Alle {len(sheet_names)} faner bliver behandlet. "
-                        "Du får én samlet Excel-fil med én udfyldt fane pr. kildefane."
+                        "Du får én samlet Excel-fil, hvor alle tracks ligger i den samme Music content-tabel."
                     )
                 else:
                     st.info(
@@ -1213,9 +1262,9 @@ if st.button("🚀 Udfyld Rapport", type="primary", disabled=button_disabled):
                     source_file_bytes=source_bytes,
                     sheet_names=sheet_names,
                 )
-                output_filename = "tv-appl-en_samlet_musikrapport.xlsx"
+                output_filename = "tv-appl-en_samlet_musikrapport_alle_tracks.xlsx"
                 download_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                download_label = "⬇️ Download samlet musikrapport"
+                download_label = "⬇️ Download samlet musikrapport med alle tracks"
 
             elif process_mode == "Alle faner" and export_mode == "Én musikrapport pr. fane":
                 finished_file_bytes, summary = process_all_sheets_separate_files(
@@ -1272,7 +1321,7 @@ if "finished_file_bytes" in st.session_state:
         st.write("**Udtræk:** Alle faner")
 
         if summary.get("mode") == "combined":
-            st.write("**Eksport:** Samlet musikrapport — én Excel-fil med én udfyldt fane pr. kildefane")
+            st.write("**Eksport:** Samlet musikrapport — én Excel-fil med alle tracks samlet i samme Music content-tabel")
         else:
             st.write("**Eksport:** Én musikrapport pr. fane — ZIP-fil med separate Excel-filer")
 
@@ -1285,12 +1334,11 @@ if "finished_file_bytes" in st.session_state:
             st.write(f"**Musiknumre sprunget over i alt:** {summary.get('song_count_skipped', 0)}")
 
         if summary.get("mode") == "combined":
-            with st.expander("Se faner i den samlede musikrapport"):
+            with st.expander("Se hvor mange tracks der blev hentet fra hver fane"):
                 for item in summary.get("summaries", []):
                     st.write(
-                        f"- **{item.get('selected_sheet', '')}** → "
-                        f"fane **{item.get('output_sheet', '')}** "
-                        f"({item.get('song_count_written', 0)} musiknumre skrevet)"
+                        f"- **{item.get('selected_sheet', '')}**: "
+                        f"{item.get('song_count_found', 0)} tracks"
                     )
         else:
             with st.expander("Se separate rapportfiler"):
@@ -1365,6 +1413,6 @@ Appen gør følgende:
 7. Splitter **Music Duration** til minutter og sekunder.
 8. Oversætter **Music Source** til skabelonens track types.
 9. Skriver værdierne ind i de eksisterende celler i skabelonen.
-10. Giver dig enten én færdig Excel-fil, én samlet musikrapport med flere faner eller en ZIP-fil med én Excel-rapport pr. fane direkte i browseren.
+10. Giver dig enten én færdig Excel-fil, én samlet musikrapport med alle tracks i samme tabel eller en ZIP-fil med én Excel-rapport pr. fane direkte i browseren.
 """
     )

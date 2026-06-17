@@ -10,13 +10,13 @@ En lille Streamlit-app, der overfører musikrapport-data fra en Excel-export med
   - én bestemt fane, eller
   - alle faner på én gang
 - Ved alle faner kan du vælge eksportform:
-  - **Samlet musikrapport**: én Excel-fil med én udfyldt fane pr. kildefane
+  - **Samlet musikrapport**: én Excel-fil, hvor alle tracks fra alle faner samles i den samme `Music content`-tabel
   - **Én musikrapport pr. fane**: én ZIP-fil med separate Excel-rapporter
 - Download resultatet direkte i browseren
 
 Hvis du vælger **én valgt fane**, får du én færdig `.xlsx`-fil.
 
-Hvis du vælger **alle faner → samlet musikrapport**, får du én samlet `.xlsx`-fil med flere faner.
+Hvis du vælger **alle faner → samlet musikrapport**, får du én samlet `.xlsx`-fil med alle tracks samlet i én rapport. Hvis der er flere tracks end skabelonens oprindelige tomme musikrækker, udvider appen kun `Music content`-området nedad og kopierer formateringen fra skabelonens sidste musikrække.
 
 Hvis du vælger **alle faner → én musikrapport pr. fane**, får du en `.zip`-fil med én færdig Excel-rapport pr. fane.
 
